@@ -53,6 +53,7 @@ import joblib
 import pyttsx3
 import pythoncom
 from collections import deque, Counter
+from supabase_client import SupabaseManager
 
 # ── Paths ───────────────────────────────────────────────────────────────────
 MODEL_PATH = os.path.join("models", "mlp_model.pkl")
@@ -325,6 +326,38 @@ class SpeechEngine:
     def shutdown(self):
         """Shutdown helper (noop in this design, for compatibility)."""
         pass
+
+
+def save_recognition(recognized_text: str, confidence: float) -> bool:
+    """
+    Saves the recognized text, confidence score, and timestamp to Supabase.
+    """
+    try:
+        from datetime import datetime, timezone
+        timestamp = datetime.now(timezone.utc).isoformat()
+        
+        # Get Supabase Manager instance
+        sb = SupabaseManager()
+        
+        # Try to insert the recognition event
+        data = {
+            "recognized_text": recognized_text,
+            "confidence": confidence,
+            "created_at": timestamp
+        }
+        
+        res = sb.insert("recognition_history", data)
+        if res is not None:
+            print("[DB] Saved Successfully")
+            return True
+        else:
+            print("[DB] Save Failed")
+            return False
+            
+    except Exception as e:
+        print("[DB] Save Failed")
+        print(f"     Error: {e}")
+        return False
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -609,6 +642,10 @@ def main():
     # ── Initialize TTS engine (singleton) ───────────────────────────────────
     tts = SpeechEngine()
 
+    # ── Initialize Supabase ─────────────────────────────────────────────────
+    supabase = SupabaseManager()
+    supabase.connect()
+
     # ── Initialize translation engine (disabled by default) ─────────────────
     # To enable Tamil: TranslationEngine(target_lang="ta", enabled=True)
     translator = TranslationEngine(target_lang="en", enabled=False)
@@ -638,7 +675,9 @@ def main():
 
     # ── State Variables (Temporal Logic) ────────────────────────────────────
     word_buffer = deque(maxlen=50)       # Current word being built letter-by-letter
+    word_confidences = []                # Confidence values for characters in the current word
     sentence_buffer = []                 # Accumulated words (list of strings)
+    sentence_confidences = []            # Confidence values for characters in the sentence
 
     # Per-frame prediction output
     current_prediction = None            # Raw prediction from model this frame
@@ -692,6 +731,7 @@ def main():
         # preventing repeated clears every frame during the COMPLETED window.
         if AUTO_CLEAR and tts.just_completed and sentence_buffer:
             sentence_buffer.clear()
+            sentence_confidences.clear()
             print("[AUTO-CLEAR] Sentence buffer cleared after speech.")
 
         # ================================================================
@@ -747,6 +787,7 @@ def main():
                         if hold_elapsed >= HOLD_TIME_REQUIRED:
                             # ── COMMIT THE LETTER ───────────────────────
                             word_buffer.append(stable_prediction)
+                            word_confidences.append(confidence)
                             last_added_letter = stable_prediction
                             locked_until_reset = True
                             hold_timer_start = None
@@ -767,6 +808,7 @@ def main():
                         if hold_elapsed >= HOLD_TIME_REQUIRED:
                             # ── COMMIT THE LETTER ───────────────────────
                             word_buffer.append(stable_prediction)
+                            word_confidences.append(confidence)
                             last_added_letter = stable_prediction
                             locked_until_reset = True
                             hold_timer_start = None
@@ -829,7 +871,9 @@ def main():
         elif key in (ord("c"), ord("C")):
             # Clear BOTH word buffer and sentence buffer
             word_buffer.clear()
+            word_confidences.clear()
             sentence_buffer.clear()
+            sentence_confidences.clear()
             last_added_letter = None
             locked_until_reset = False
             print("[CLEAR] Word + sentence buffers cleared.")
@@ -838,15 +882,19 @@ def main():
             current_word = "".join(word_buffer).strip()
             if current_word:
                 sentence_buffer.append(current_word)
+                sentence_confidences.extend(word_confidences)
                 print(f"[WORD] \"{current_word}\" added to sentence. "
                       f"Sentence: {' '.join(sentence_buffer)}")
             word_buffer.clear()
+            word_confidences.clear()
             last_added_letter = None
             locked_until_reset = False
 
         elif key == 8:  # BACKSPACE
             if word_buffer:
                 removed = word_buffer.pop()
+                if word_confidences:
+                    word_confidences.pop()
                 print(f"[BKSP] Removed '{removed}'.")
                 last_added_letter = None
                 locked_until_reset = False
@@ -857,11 +905,21 @@ def main():
             current_word = "".join(word_buffer).strip()
             if current_word:
                 sentence_buffer.append(current_word)
+                sentence_confidences.extend(word_confidences)
                 word_buffer.clear()
+                word_confidences.clear()
 
             if sentence_buffer:
                 full_sentence = " ".join(sentence_buffer)
                 print(f"[DEBUG] Text:\n{full_sentence}")
+                
+                # Calculate average confidence
+                if sentence_confidences:
+                    avg_conf = (sum(sentence_confidences) / len(sentence_confidences)) * 100.0
+                else:
+                    avg_conf = 100.0
+                avg_conf = round(avg_conf, 1)
+
                 # Apply translation (pass-through by default)
                 translated = translator.translate(full_sentence)
                 spoken = tts.speak(translated)
@@ -869,6 +927,9 @@ def main():
                 if spoken:
                     feedback_message = f"Speaking: {translated}"
                     feedback_timestamp = now
+                    
+                    # Save to Supabase (does not block speech)
+                    save_recognition(full_sentence, avg_conf)
             else:
                 print("[TTS] No text available to speak.")
                 feedback_message = "No text to speak"
