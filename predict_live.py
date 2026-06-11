@@ -122,6 +122,34 @@ LANGUAGE_CONFIG = {
 
 AVAILABLE_LANGUAGES = list(LANGUAGE_CONFIG.keys())
 
+# ── Emergency Configuration ──────────────────────────────────────────────────
+EMERGENCY_KEYWORDS = {
+    "English": ["HELP", "EMERGENCY", "DOCTOR", "AMBULANCE", "MEDICINE", "HOSPITAL", "PAIN", "ACCIDENT", "DANGER", "FIRE"],
+    "Tamil": ["உதவி", "அவசரம்", "மருத்துவர்", "ஆம்புலன்ஸ்", "மருத்துவமனை", "வலி", "விபத்து", "ஆபத்து", "தீ"]
+}
+
+def is_emergency_text(text: str) -> str | None:
+    """
+    Checks if text (case-insensitive) contains any of the emergency keywords.
+    Returns the matched keyword if found, otherwise None.
+    """
+    if not text:
+        return None
+    
+    # Check English keywords (tokenized comparison)
+    tokens = [t.upper().strip() for t in text.split()]
+    for kw in EMERGENCY_KEYWORDS["English"]:
+        if kw in tokens:
+            return kw
+
+    # Check Tamil keywords (direct substring match is safer because of word builders)
+    for kw in EMERGENCY_KEYWORDS["Tamil"]:
+        if kw in text:
+            return kw
+
+    return None
+
+
 TRANSLATION_DICT = {
     "Tamil": {
         "HELLO": "வணக்கம்",
@@ -362,7 +390,7 @@ class SpeechEngine:
 
         print("[OK] TTS engine interface initialized.")
 
-    def _speak_thread(self, text, language="English"):
+    def _speak_thread(self, text, language="English", volume=None):
         """Background thread: handles SAPI5 COM apartment, engine init, speech, and destruction."""
         import pythoncom
         pythoncom.CoInitialize()
@@ -371,7 +399,7 @@ class SpeechEngine:
             print("[DEBUG] Engine Created")
             engine = pyttsx3.init()
             engine.setProperty("rate", TTS_SPEECH_RATE)
-            engine.setProperty("volume", TTS_VOLUME)
+            engine.setProperty("volume", volume if volume is not None else TTS_VOLUME)
 
             # Attempt Tamil voice selection if requested
             if language == "Tamil":
@@ -445,13 +473,14 @@ class SpeechEngine:
                 return True
             return False
 
-    def speak(self, text: str, language: str = "English") -> bool:
+    def speak(self, text: str, language: str = "English", volume: float = None) -> bool:
         """
         Submit a speech request by spawning a new background thread.
 
         Args:
             text: The text to speak.
             language: Language for TTS voice selection ("English" or "Tamil").
+            volume: Volume level override (0.0 to 1.0).
 
         Returns True if the request was accepted, False if rejected
         (empty text or already speaking).
@@ -484,7 +513,7 @@ class SpeechEngine:
         # Launch speech in background thread (Fix 9)
         t = threading.Thread(
             target=self._speak_thread,
-            args=(clean_text, language),
+            args=(clean_text, language, volume),
             name="TTS-Request-Thread",
             daemon=True
         )
@@ -541,6 +570,141 @@ def get_recent_history() -> list | None:
     except Exception as e:
         print(f"[DB] Error fetching history: {e}")
         return None
+
+
+# ── Emergency Assistance Mode Modules ────────────────────────────────────────
+
+def _play_emergency_sound():
+    """Plays a non-blocking siren tone using Windows winsound."""
+    import winsound
+    try:
+        # Playing a high-low siren tone
+        for _ in range(3):
+            winsound.Beep(1200, 250)
+            winsound.Beep(800, 250)
+    except Exception as e:
+        print(f"[WARN] Emergency audio alert failed: {e}")
+
+
+def trigger_sound_alert():
+    """Trigger the emergency sound alert in a separate background thread."""
+    threading.Thread(target=_play_emergency_sound, name="EmergencySoundThread", daemon=True).start()
+
+
+def save_emergency_event(detected_keyword: str, recognized_text: str,
+                         translated_text: str = "", language: str = "English",
+                         confidence: float = 100.0) -> bool:
+    """
+    Saves the emergency event details to the Supabase table `emergency_events`.
+    """
+    try:
+        from datetime import datetime, timezone
+        timestamp = datetime.now(timezone.utc).isoformat()
+        
+        sb = SupabaseManager()
+        
+        data = {
+            "detected_keyword": detected_keyword,
+            "recognized_text": recognized_text,
+            "translated_text": translated_text,
+            "language": language,
+            "confidence": confidence,
+            "created_at": timestamp
+        }
+        
+        res = sb.insert("emergency_events", data)
+        if res is not None:
+            print("[DB] Emergency Event Saved Successfully")
+            return True
+        else:
+            print("[DB] Save Emergency Event Failed")
+            return False
+    except Exception as e:
+        print("[DB] Save Emergency Event Failed")
+        print(f"     Error: {e}")
+        return False
+
+
+def get_emergency_history() -> list | None:
+    """
+    Fetches the latest 5 records from emergency_events table in Supabase.
+    """
+    try:
+        sb = SupabaseManager()
+        res = sb.client.table("emergency_events").select("*").order("created_at", descending=True).limit(5).execute()
+        return res.data
+    except Exception as e:
+        print(f"[DB] Error fetching emergency history: {e}")
+        return None
+
+
+def print_emergency_history():
+    """Fetches and prints the recent emergency events history to the console."""
+    history = get_emergency_history()
+    if history:
+        print("\n" + "═" * 58)
+        print("  EMERGENCY ASSISTANCE LOGS (Latest 5 Events)")
+        print("═" * 58)
+        for event in history:
+            kw = event.get("detected_keyword", "N/A")
+            msg = event.get("recognized_text", "N/A")
+            created_at = event.get("created_at", "N/A")
+            lang = event.get("language", "English")
+            
+            try:
+                from datetime import datetime
+                time_part = datetime.fromisoformat(created_at.replace("Z", "+00:00")).strftime("%Y-%m-%d %H:%M:%S")
+            except Exception:
+                time_part = created_at
+                
+            print(f"[{time_part}] | Language: {lang} | Keyword: {kw}")
+            print(f"  Recognized Text: {msg}")
+            print("-" * 58)
+        print("═" * 58 + "\n")
+
+
+def get_emergency_count_today() -> int:
+    """
+    Queries Supabase to get the number of emergency events created today (UTC).
+    """
+    try:
+        from datetime import datetime, timezone
+        now_utc = datetime.now(timezone.utc)
+        today_start = datetime(now_utc.year, now_utc.month, now_utc.day, tzinfo=timezone.utc).isoformat()
+        
+        sb = SupabaseManager()
+        res = sb.client.table("emergency_events").select("id", count="exact").gte("created_at", today_start).execute()
+        return res.count if res.count is not None else len(res.data)
+    except Exception as e:
+        print(f"[DB] Error getting today's emergency count: {e}")
+        return 0
+
+
+# ── Future-Ready Notification Hooks (Optional Modules) ────────────────────────
+
+def send_sms_alert(keyword: str, recognized_text: str, language: str):
+    """Optional future module: SMS Integration (e.g., Twilio)."""
+    pass
+
+
+def send_whatsapp_alert(keyword: str, recognized_text: str, language: str):
+    """Optional future module: WhatsApp Business API integration."""
+    pass
+
+
+def send_email_alert(keyword: str, recognized_text: str, language: str):
+    """Optional future module: Email Notification (SMTP / SendGrid)."""
+    pass
+
+
+def notify_caregiver(keyword: str, recognized_text: str, language: str):
+    """Optional future module: Push Notifications to Caregiver companion app."""
+    pass
+
+
+def share_location():
+    """Optional future module: Location Sharing (GPS / IP Geolocation)."""
+    return "Lat: 13.0827, Lon: 80.2707 (Chennai, India)"
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -782,6 +946,12 @@ def draw_hud(frame, prediction, confidence, probabilities, label_names,
         cv2.putText(frame, hint, (hint_x, panel_y + 135),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.45, GRAY, 1, cv2.LINE_AA)
 
+    # ── Emergency events daily counter (always visible at bottom of right panel) ──
+    emergency_count = state.get("emergency_count_today", 0)
+    counter_text = f"Emergency Events Today: {emergency_count}"
+    cv2.putText(frame, counter_text, (panel_x + 15, panel_y + panel_h - 15),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.42, (80, 80, 255) if emergency_count > 0 else GRAY, 1, cv2.LINE_AA)
+
     # ── Feedback banner (e.g. "Added A") ────────────────────────────────────
     if state["feedback_message"]:
         fb_text = state["feedback_message"]
@@ -840,6 +1010,43 @@ def draw_hud(frame, prediction, confidence, probabilities, label_names,
     controls = "[Q]Quit [C]Clear [L]Lang [SPC]Word [BKSP]Del [ENTER]Speak"
     cv2.putText(frame, controls, (w - 480, bar_y + 36),
                 cv2.FONT_HERSHEY_SIMPLEX, 0.38, GRAY, 1, cv2.LINE_AA)
+
+    # ── Emergency Pop-up Modal (drawn on top of all elements) ──────────────────
+    if state.get("emergency_active", False):
+        emergency_keyword = state.get("emergency_keyword", "UNKNOWN")
+        emergency_time = state.get("emergency_trigger_time", time.time())
+        emergency_language = state.get("emergency_language", "English")
+        
+        alert_w = 480
+        alert_h = 200
+        x1 = (w - alert_w) // 2
+        y1 = (h - alert_h) // 2
+        x2 = x1 + alert_w
+        y2 = y1 + alert_h
+        
+        # Red background panel
+        draw_rounded_rect(frame, (x1, y1), (x2, y2), (50, 50, 255), radius=16, alpha=0.95)
+        # Border outline
+        cv2.rectangle(frame, (x1, y1), (x2, y2), WHITE, 2, cv2.LINE_AA)
+        
+        # Indicator Circle (to simulate 🔴)
+        cv2.circle(frame, (x1 + 35, y1 + 40), 10, (0, 0, 255), -1)
+        cv2.circle(frame, (x1 + 35, y1 + 40), 12, WHITE, 1, cv2.LINE_AA)
+        
+        # Title text
+        cv2.putText(frame, "EMERGENCY DETECTED", (x1 + 60, y1 + 47),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.75, WHITE, 2, cv2.LINE_AA)
+        
+        # Details
+        cv2.putText(frame, f"Detected Keyword: {emergency_keyword}", (x1 + 30, y1 + 95),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, YELLOW, 2, cv2.LINE_AA)
+        
+        local_time_str = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(emergency_time))
+        cv2.putText(frame, f"Timestamp: {local_time_str}", (x1 + 30, y1 + 135),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.52, WHITE, 1, cv2.LINE_AA)
+        
+        cv2.putText(frame, f"Language: {emergency_language}", (x1 + 30, y1 + 170),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.52, WHITE, 1, cv2.LINE_AA)
 
 
 # ── Temporal Logic Engine ───────────────────────────────────────────────────
@@ -939,6 +1146,20 @@ def main():
     feedback_message = None              # e.g. "Added A"
     feedback_timestamp = 0.0             # time.time() when feedback was set
 
+    # ── Emergency State Variables ───────────────────────────────────────────
+    emergency_active = False
+    emergency_keyword = ""
+    emergency_trigger_time = 0.0
+    emergency_language = "English"
+    last_emergency_trigger_time = 0.0
+    emergency_cooldown_duration = 30.0  # 30 seconds duplicate protection
+    emergency_display_duration = 5.0    # Show alert popup for at least 5 seconds
+    
+    # Query today's emergency count on boot (cached value incremented locally)
+    print("[DB] Fetching today's emergency events count...")
+    emergency_count_today = get_emergency_count_today()
+    print(f"[DB] Initialized today's count: {emergency_count_today}")
+
     # FPS tracking
     prev_time = time.time()
     fps = 0.0
@@ -966,6 +1187,10 @@ def main():
         # ── Expire feedback message after FEEDBACK_DISPLAY_DURATION ──────
         if feedback_message and (now - feedback_timestamp) > FEEDBACK_DISPLAY_DURATION:
             feedback_message = None
+
+        # ── Expire emergency alert after emergency_display_duration ──────
+        if emergency_active and (now - emergency_trigger_time) > emergency_display_duration:
+            emergency_active = False
 
         # ── Auto-clear sentence buffer after speech completes ────────────
         # Uses the one-shot `just_completed` flag to fire exactly once,
@@ -1078,6 +1303,66 @@ def main():
                 last_added_letter = None
                 print("[RESET] Hand removed — lock cleared.")
 
+        # ── Monitor Emergency Keywords ──────────────────────────────────────
+        current_word_str = "".join(word_buffer).strip()
+        current_sentence_str = " ".join(sentence_buffer).strip()
+        
+        detected_kw = is_emergency_text(current_word_str)
+        if not detected_kw:
+            detected_kw = is_emergency_text(current_sentence_str)
+            
+        if detected_kw:
+            if now - last_emergency_trigger_time >= emergency_cooldown_duration:
+                emergency_active = True
+                emergency_keyword = detected_kw
+                emergency_trigger_time = now
+                emergency_language = selected_language
+                last_emergency_trigger_time = now
+                
+                print(f"[EMERGENCY] Active! Keyword: {detected_kw}")
+                
+                # 1. Sound Alert (non-blocking background thread)
+                trigger_sound_alert()
+                
+                # 2. Priority Speech (concat and speak at max volume)
+                if selected_language == "Tamil":
+                    text_to_translate = current_sentence_str if current_sentence_str else current_word_str
+                    translated_tamil = translate_to_tamil(text_to_translate)
+                    priority_text = "அவசர உதவி கோரப்பட்டுள்ளது. " + translated_tamil
+                    speech_lang = "Tamil"
+                else:
+                    text_to_speak = current_sentence_str if current_sentence_str else current_word_str
+                    priority_text = "Emergency assistance requested. " + text_to_speak
+                    speech_lang = "English"
+                
+                tts.speak(priority_text, language=speech_lang, volume=1.0)
+                
+                # 3. Supabase Log (non-blocking background thread)
+                db_translated = translate_to_tamil(current_sentence_str) if selected_language == "Tamil" else ""
+                db_thread = threading.Thread(
+                    target=save_emergency_event,
+                    args=(detected_kw, current_sentence_str, db_translated, selected_language, 100.0),
+                    daemon=True
+                )
+                db_thread.start()
+                
+                # Increment count
+                emergency_count_today += 1
+                
+                # 4. Print history in console (delayed print to allow write completion)
+                def delayed_history():
+                    time.sleep(1.5)
+                    print_emergency_history()
+                threading.Thread(target=delayed_history, daemon=True).start()
+                
+                # 5. Future hooks
+                send_sms_alert(detected_kw, current_sentence_str, selected_language)
+                send_whatsapp_alert(detected_kw, current_sentence_str, selected_language)
+                send_email_alert(detected_kw, current_sentence_str, selected_language)
+                notify_caregiver(detected_kw, current_sentence_str, selected_language)
+                loc = share_location()
+                print(f"[FUTURE READY] Share location: {loc}")
+
         # ── Compute HUD state dict ──────────────────────────────────────
         hold_elapsed = 0.0
         is_holding = False
@@ -1091,6 +1376,11 @@ def main():
             "is_holding": is_holding,
             "locked_until_reset": locked_until_reset,
             "feedback_message": feedback_message,
+            "emergency_active": emergency_active,
+            "emergency_keyword": emergency_keyword,
+            "emergency_trigger_time": emergency_trigger_time,
+            "emergency_language": emergency_language,
+            "emergency_count_today": emergency_count_today,
         }
 
         # ── FPS ─────────────────────────────────────────────────────────
