@@ -345,6 +345,7 @@ into a single assistive communication platform.
 # 👨‍💻 Developed By
 
 **Ragav**
+
 Artificial Intelligence & Data Science Student
 
 ---
