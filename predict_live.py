@@ -126,12 +126,12 @@ HAND_MISSING_GRACE_FRAMES = 5
 EMOTION_DETECT_INTERVAL = 30
 
 # ── Webcam Resolution ──────────────────────────────────────────────────────
-WEBCAM_WIDTH = 640
-WEBCAM_HEIGHT = 480
+WEBCAM_WIDTH = 1920
+WEBCAM_HEIGHT = 1080
 
 # ── Motion Detection ───────────────────────────────────────────────────────
 # MOTION_THRESHOLD=0.015: average inter-frame landmark displacement above this
-#   value indicates the hand is moving. Pauses prediction to avoid noise.
+# value indicates the hand is moving. Pauses prediction to avoid noise.
 MOTION_THRESHOLD = 0.015
 
 # ── Hand Quality Thresholds ────────────────────────────────────────────────
@@ -377,14 +377,35 @@ def translate_to_tamil(text: str) -> str:
     cleaned_text = text.strip()
     upper_text = cleaned_text.upper()
 
+    def log_translation(source, match_type, api_status, output):
+        log_str = f"[TRANSLATE]\nSource: {source}\nDictionary Match: {match_type}\n"
+        if api_status:
+            log_str += f"{api_status}\n"
+        log_str += f"Output: {output}"
+        try:
+            print(log_str)
+        except Exception:
+            try:
+                enc = sys.stdout.encoding or 'utf-8'
+                print(log_str.encode(enc, errors='replace').decode(enc, errors='replace'))
+            except Exception:
+                pass
+
     # 1. Try local dictionary lookup first (instant & offline-friendly)
     lang_dict = TRANSLATION_DICT.get("Tamil", {})
     if upper_text in lang_dict:
-        return lang_dict[upper_text]
+        tamil_val = lang_dict[upper_text]
+        log_translation(cleaned_text, "Yes", None, tamil_val)
+        return tamil_val
 
     # 2. Check memory cache for previous translations
     if cleaned_text in _translation_cache:
-        return _translation_cache[cleaned_text]
+        cached_val = _translation_cache[cleaned_text]
+        if cached_val != cleaned_text:
+            log_translation(cleaned_text, "No", "Google Translate Used", cached_val)
+        else:
+            log_translation(cleaned_text, "No", "Google Translate Used (Failed)", cleaned_text)
+        return cached_val
 
     # 3. Call googletrans API
     try:
@@ -395,6 +416,7 @@ def translate_to_tamil(text: str) -> str:
         result = _google_translator.translate(cleaned_text, src='en', dest='ta')
         if result and result.text:
             _translation_cache[cleaned_text] = result.text
+            log_translation(cleaned_text, "No", "Google Translate Used", result.text)
             return result.text
         else:
             print("[ERROR] Tamil Translation Failed")
@@ -402,8 +424,10 @@ def translate_to_tamil(text: str) -> str:
         print(f"[ERROR] Tamil Translation Failed: {e}")
 
     # Cache original text on failure to prevent spamming the API on every frame
-    _translation_cache[cleaned_text] = text
-    return text
+    _translation_cache[cleaned_text] = cleaned_text
+    log_translation(cleaned_text, "No", "Google Translate Used (Failed)", cleaned_text)
+    return cleaned_text
+
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -1027,6 +1051,58 @@ def extract_landmarks(hand_landmarks) -> np.ndarray:
     return np.array(coords, dtype=np.float32).reshape(1, -1)
 
 
+def count_extended_fingers(hand_landmarks) -> int:
+    """
+    Count the number of extended fingers using MediaPipe landmarks.
+    Uses orientation-invariant Euclidean distances.
+    """
+    try:
+        # Extract 3D coordinates
+        if hasattr(hand_landmarks, 'landmark'):
+            coords = np.array([[lm.x, lm.y, lm.z] for lm in hand_landmarks.landmark], dtype=np.float32)
+        else:
+            coords = np.array(hand_landmarks, dtype=np.float32).reshape(21, 3)
+
+        # 1. Translate relative to wrist (landmark 0)
+        wrist = coords[0]
+        translated = coords - wrist
+
+        # 2. Normalize scale by wrist-to-middle-MCP (9) distance
+        hand_scale = np.linalg.norm(translated[9])
+        if hand_scale < 1e-6:
+            hand_scale = 1.0
+        normalized = translated / hand_scale
+
+        # 3. Determine if each finger is extended
+        # Thumb: extended if distance from tip (4) to index MCP (5) is > 0.8
+        thumb_extended = np.linalg.norm(normalized[4] - normalized[5]) > 0.8
+
+        # Other fingers: extended if distance from tip to wrist is greater than PIP to wrist
+        index_extended = np.linalg.norm(normalized[8]) > np.linalg.norm(normalized[6])
+        middle_extended = np.linalg.norm(normalized[12]) > np.linalg.norm(normalized[10])
+        ring_extended = np.linalg.norm(normalized[16]) > np.linalg.norm(normalized[14])
+        pinky_extended = np.linalg.norm(normalized[20]) > np.linalg.norm(normalized[18])
+
+        extended_fingers = 0
+        if thumb_extended:
+            extended_fingers += 1
+        if index_extended:
+            extended_fingers += 1
+        if middle_extended:
+            extended_fingers += 1
+        if ring_extended:
+            extended_fingers += 1
+        if pinky_extended:
+            extended_fingers += 1
+
+        return extended_fingers
+    except Exception as e:
+        print(f"[GH CHECK] Error counting fingers: {e}")
+        return -1
+
+
+
+
 # ═══════════════════════════════════════════════════════════════════════════
 # HUD Drawing Utilities
 # ═══════════════════════════════════════════════════════════════════════════
@@ -1464,6 +1540,12 @@ def draw_hud(frame, prediction, confidence, probabilities, label_names,
 
             # ── Hold-time progress (temporal feedback) ──────────────────────────
             y_hold = panel_y + int(195 * u_scale)
+            if prediction in ("G", "H") and state.get("finger_count", -1) != -1:
+                f_count = state["finger_count"]
+                cv2.putText(frame, f"Finger Count: {f_count}", (panel_x + int(15 * u_scale), y_hold),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.48 * u_scale, YELLOW, max(1, int(1 * u_scale)), cv2.LINE_AA)
+                y_hold += int(25 * u_scale)
+
             if state["is_holding"]:
                 elapsed = state["hold_elapsed"]
                 progress = elapsed / HOLD_TIME_REQUIRED
@@ -1782,6 +1864,7 @@ def main():
 
         hand_detected = False
         now = time.time()
+        finger_count = -1
 
         # ── Expire feedback message after FEEDBACK_DISPLAY_DURATION ──────
         if feedback_message and (now - feedback_timestamp) > FEEDBACK_DISPLAY_DURATION:
@@ -1887,6 +1970,18 @@ def main():
                     current_prediction = le.inverse_transform(model.predict(features_scaled))[0]
                     probabilities = model.predict_proba(features_scaled)[0]
                     confidence = float(np.max(probabilities))
+
+                    # Post-processing verification and correction layer for G & H
+                    if current_prediction in ("G", "H"):
+                        finger_count = count_extended_fingers(hand_lm)
+                        if confidence >= 0.80:
+                            if finger_count in (1, 2):
+                                corrected_prediction = "G" if finger_count == 1 else "H"
+                                print(f"[GH CHECK]\nOriginal: {current_prediction}\nFingers: {finger_count}\nCorrected: {corrected_prediction}")
+                                current_prediction = corrected_prediction
+                            elif finger_count != -1:
+                                # Failsafe: if count is determined but not 1 or 2, keep original but log check
+                                print(f"[GH CHECK]\nOriginal: {current_prediction}\nFingers: {finger_count}\nCorrected: {current_prediction}")
 
                     # ── Step 3: Confidence Filtering ─────────────────────────────
                     filtered_pred = current_prediction if confidence >= CONFIDENCE_THRESHOLD else None
@@ -2057,6 +2152,7 @@ def main():
             "process_time_ms": frame_process_time_ms,
             "avg_process_time_ms": float(np.mean(process_time_history)) if process_time_history else 0.0,
             "smoother_alpha": landmark_smoother.current_alpha,
+            "finger_count": finger_count,
         }
 
         # ── Frame Processing Time ───────────────────────────────────────────
