@@ -553,20 +553,12 @@ class SpeechEngine:
         print("[OK] TTS persistent speech engine initialized.")
 
     def _worker_loop(self):
-        """Persistent background worker loop that handles pyttsx3 commands."""
+        """Persistent background worker loop that handles speech requests."""
         import pythoncom
         pythoncom.CoInitialize()
-        engine = None
-        try:
-            print("[DEBUG] Engine Created (Single Instance)")
-            engine = pyttsx3.init()
-            engine.setProperty("rate", TTS_SPEECH_RATE)
-            engine.setProperty("volume", TTS_VOLUME)
-            self._engine_ready.set()
-        except Exception as e:
-            print(f"[ERROR] Failed to initialize pyttsx3 engine: {e}")
-            pythoncom.CoUninitialize()
-            return
+
+        # Set engine ready event immediately for backward compatibility
+        self._engine_ready.set()
 
         while not self._shutdown_event.is_set():
             try:
@@ -606,10 +598,6 @@ class SpeechEngine:
                     pass
 
             try:
-                # Set dynamic volume override
-                engine.setProperty("volume", volume if volume is not None else TTS_VOLUME)
-
-                # Attempt Tamil voice selection if requested
                 if language == "Tamil":
                     tamil_tts_success = False
                     temp_file_path = "temp.mp3"
@@ -667,7 +655,43 @@ class SpeechEngine:
                             fallback_text = text
                             print("[TTS] Transliteration empty and no English fallback. Playing original Tamil.")
 
-                        # Reset voice to default English
+                        # Create fresh pyttsx3 engine for the fallback request
+                        engine = None
+                        try:
+                            engine = pyttsx3.init()
+                            engine.setProperty("rate", TTS_SPEECH_RATE)
+                            engine.setProperty("volume", volume if volume is not None else TTS_VOLUME)
+                            try:
+                                voices = engine.getProperty("voices")
+                                for voice in voices:
+                                    voice_name = voice.name.lower() if hasattr(voice, 'name') else ""
+                                    if 'tamil' not in voice_name:
+                                        engine.setProperty("voice", voice.id)
+                                        break
+                            except Exception:
+                                pass
+
+                            print("[DEBUG] Speech Started")
+                            engine.say(fallback_text)
+                            engine.runAndWait()
+                            print("[DEBUG] Speech Finished")
+                        except Exception as fe:
+                            print(f"[ERROR] pyttsx3 fallback speech failed: {fe}")
+                        finally:
+                            if engine is not None:
+                                try:
+                                    engine.stop()
+                                except Exception:
+                                    pass
+                                del engine
+
+                else:
+                    # Create fresh pyttsx3 engine for every English request
+                    engine = None
+                    try:
+                        engine = pyttsx3.init()
+                        engine.setProperty("rate", TTS_SPEECH_RATE)
+                        engine.setProperty("volume", volume if volume is not None else TTS_VOLUME)
                         try:
                             voices = engine.getProperty("voices")
                             for voice in voices:
@@ -679,26 +703,18 @@ class SpeechEngine:
                             pass
 
                         print("[DEBUG] Speech Started")
-                        engine.say(fallback_text)
+                        engine.say(text)
                         engine.runAndWait()
                         print("[DEBUG] Speech Finished")
-
-                else:
-                    # Reset voice to default English
-                    try:
-                        voices = engine.getProperty("voices")
-                        for voice in voices:
-                            voice_name = voice.name.lower() if hasattr(voice, 'name') else ""
-                            if 'tamil' not in voice_name:
-                                engine.setProperty("voice", voice.id)
-                                break
-                    except Exception:
-                        pass
-
-                    print("[DEBUG] Speech Started")
-                    engine.say(text)
-                    engine.runAndWait()
-                    print("[DEBUG] Speech Finished")
+                    except Exception as ee:
+                        print(f"[ERROR] pyttsx3 speech failed: {ee}")
+                    finally:
+                        if engine is not None:
+                            try:
+                                engine.stop()
+                            except Exception:
+                                pass
+                            del engine
 
             except Exception as e:
                 print(f"[ERROR] Exception during speech execution: {e}")
@@ -716,15 +732,6 @@ class SpeechEngine:
                 # Diagnostic logs after request processed
                 worker_alive = self._worker_thread.is_alive()
                 print(f"[DEBUG TTS] Worker Alive: {worker_alive} | Queue Size: {self._queue.qsize()} | Status: {self.status} | is_speaking: {self.is_speaking}")
-
-        # Shutdown cleanup
-        if engine is not None:
-            try:
-                engine.stop()
-            except Exception:
-                pass
-            del engine
-            print("[DEBUG] Engine Destroyed")
 
         pythoncom.CoUninitialize()
 
@@ -771,7 +778,7 @@ class SpeechEngine:
 
         Returns True if the request was accepted (queued), False if rejected (empty text).
         """
-        print("[DEBUG] speak() called")
+        print("[DEBUG] Speech Requested")
         if not text or not text.strip():
             print("[TTS] No text to speak.")
             return False
