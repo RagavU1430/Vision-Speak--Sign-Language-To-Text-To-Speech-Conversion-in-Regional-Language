@@ -17,18 +17,24 @@ Usage:
 
 import os
 import time
+from pathlib import Path
+from dotenv import load_dotenv
 
-# ═══════════════════════════════════════════════════════════════════════════
+# Load .env from project root regardless of working directory
+load_dotenv(Path(__file__).parent / ".env")
+
+# ════════════════════════════════════════════════════════════════════════════
 # Configuration
 # ═══════════════════════════════════════════════════════════════════════════
 
-SUPABASE_URL = "https://skcikbrkwszfmknwjgeb.supabase.co"
-SUPABASE_ANON_KEY = (
-    "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9."
-    "eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InNrY2lrYnJrd3N6Zm1rbndqZ2ViIiwi"
-    "cm9sZSI6InNlcnZpY2Vfcm9sZSIsImlhdCI6MTc4MDkyMjM3MSwiZXhwIjoyMDk2"
-    "NDk4MzcxfQ.b1h78Vg8-RxEDBBzJZv1nB46dUC-ZOOyKPYyNLikb-w"
-)
+SUPABASE_URL = os.getenv("SUPABASE_URL")
+SUPABASE_ANON_KEY = os.getenv("SUPABASE_ANON_KEY")
+
+if not SUPABASE_URL or not SUPABASE_ANON_KEY:
+    raise ValueError(
+        "Missing Supabase credentials. "
+        "Copy .env.example to .env and set SUPABASE_URL and SUPABASE_ANON_KEY"
+    )
 
 
 # ═══════════════════════════════════════════════════════════════════════════

@@ -31,48 +31,97 @@ with suppress_c_stderr():
     dummy_frame = np.zeros((100, 100, 3), dtype=np.uint8)
     hands.process(dummy_frame)
 
-# Class to smooth hand landmarks using Exponential Moving Average (EMA) to eliminate jitter
+class OneEuroFilter:
+    """
+    One Euro Filter: A first-order low-pass filter with an adaptive cutoff frequency
+    that adapts to the velocity of the signal. Ideal for eliminating jitter at rest
+    and lag during movement.
+    """
+    def __init__(self, min_cutoff=0.5, beta=0.01, d_cutoff=1.0):
+        self.min_cutoff = float(min_cutoff)
+        self.beta = float(beta)
+        self.d_cutoff = float(d_cutoff)
+        self.x_filt = None
+        self.dx_filt = None
+        self.t_prev = None
+
+    def __call__(self, t, x):
+        if self.x_filt is None:
+            self.x_filt = x.copy()
+            self.dx_filt = np.zeros_like(x, dtype=np.float32)
+            self.t_prev = t
+            return self.x_filt
+
+        dt = t - self.t_prev
+        if dt <= 0:
+            return self.x_filt
+
+        # Compute velocity and filter it
+        dx = (x - self.x_filt) / dt
+        d_alpha = self._alpha(dt, self.d_cutoff)
+        self.dx_filt = d_alpha * dx + (1.0 - d_alpha) * self.dx_filt
+
+        # Compute cutoff frequency and filter signal
+        cutoff = self.min_cutoff + self.beta * np.abs(self.dx_filt)
+        alpha = self._alpha(dt, cutoff)
+        self.x_filt = alpha * x + (1.0 - alpha) * self.x_filt
+        self.t_prev = t
+        return self.x_filt
+
+    def _alpha(self, dt, cutoff):
+        r = 2.0 * np.pi * cutoff * dt
+        return r / (r + 1.0)
+
+
+# Class to smooth hand landmarks using One Euro Filter to eliminate jitter and lag
 class HandSmoother:
-    def __init__(self, alpha=0.6):
-        self.alpha = alpha
-        # List of previous hand landmarks stored as raw coordinate values: list of list of (x, y, z)
-        self.prev_hands = []
+    def __init__(self, min_cutoff=0.5, beta=0.01):
+        self.min_cutoff = min_cutoff
+        self.beta = beta
+        # List of tracked hands: each entry is {"filter": OneEuroFilter, "last_wrist": (x, y, z)}
+        self.tracked_hands = []
 
     def smooth(self, current_hands):
+        now = time.time()
         if not current_hands:
-            self.prev_hands = []
+            self.tracked_hands = []
             return current_hands
 
-        new_prev_hands = []
+        new_tracked_hands = []
         for curr_hand in current_hands:
             curr_wrist = curr_hand.landmark[0]
             best_match_idx = -1
             min_dist = 0.15  # Max wrist distance to consider it the same hand
             
-            for idx, prev_hand in enumerate(self.prev_hands):
-                prev_wrist_x, prev_wrist_y, _ = prev_hand[0]
+            for idx, tracked in enumerate(self.tracked_hands):
+                prev_wrist_x, prev_wrist_y, _ = tracked["last_wrist"]
                 dist = ((curr_wrist.x - prev_wrist_x)**2 + (curr_wrist.y - prev_wrist_y)**2)**0.5
                 if dist < min_dist:
                     min_dist = dist
                     best_match_idx = idx
             
-            smoothed_coords = []
+            curr_coords = np.array([[lm.x, lm.y, lm.z] for lm in curr_hand.landmark], dtype=np.float32)
+            
             if best_match_idx != -1:
-                prev_hand = self.prev_hands[best_match_idx]
-                for curr_lm, prev_lm in zip(curr_hand.landmark, prev_hand):
-                    prev_x, prev_y, prev_z = prev_lm
-                    # Apply EMA formula: new = alpha * current + (1 - alpha) * previous
-                    curr_lm.x = self.alpha * curr_lm.x + (1 - self.alpha) * prev_x
-                    curr_lm.y = self.alpha * curr_lm.y + (1 - self.alpha) * prev_y
-                    curr_lm.z = self.alpha * curr_lm.z + (1 - self.alpha) * prev_z
-                    smoothed_coords.append((curr_lm.x, curr_lm.y, curr_lm.z))
+                tracked = self.tracked_hands[best_match_idx]
+                filt = tracked["filter"]
+                smoothed = filt(now, curr_coords)
             else:
-                for curr_lm in curr_hand.landmark:
-                    smoothed_coords.append((curr_lm.x, curr_lm.y, curr_lm.z))
+                filt = OneEuroFilter(min_cutoff=self.min_cutoff, beta=self.beta)
+                smoothed = filt(now, curr_coords)
             
-            new_prev_hands.append(smoothed_coords)
+            # Update landmark values in place
+            for i, lm in enumerate(curr_hand.landmark):
+                lm.x = float(smoothed[i, 0])
+                lm.y = float(smoothed[i, 1])
+                lm.z = float(smoothed[i, 2])
             
-        self.prev_hands = new_prev_hands
+            new_tracked_hands.append({
+                "filter": filt,
+                "last_wrist": (curr_hand.landmark[0].x, curr_hand.landmark[0].y, curr_hand.landmark[0].z)
+            })
+            
+        self.tracked_hands = new_tracked_hands
         return current_hands
 
 # Initialize drawing utils to draw skeleton/landmarks
@@ -119,8 +168,8 @@ def draw_hud(frame, fps, hand_count):
     cv2.putText(frame, f"{hand_count}", (x + 80, y + 85), 
                 cv2.FONT_HERSHEY_SIMPLEX, 0.65, hand_color, 2, cv2.LINE_AA)
 
-# Initialize smoother
-smoother = HandSmoother(alpha=0.6)
+# Initialize smoother using One Euro Filter defaults
+smoother = HandSmoother()
 
 # Initialize webcam and set resolution to 1280x720 for sharper hand details
 cap = cv2.VideoCapture(0)

@@ -44,11 +44,12 @@ Requirements:
 """
 
 # ── Suppress noisy logs ────────────────────────────────────────────────────
-import os, warnings
+import os, warnings, logging
 
 os.environ["GLOG_minloglevel"] = "3"
 os.environ["TF_CPP_MIN_LOG_LEVEL"] = "3"
 warnings.filterwarnings("ignore")
+logging.getLogger("httpx").setLevel(logging.WARNING)
 
 # ── Monkeypatch httpcore for googletrans compatibility ──────────────────────
 import httpcore
@@ -71,6 +72,7 @@ import pythoncom
 from collections import deque, Counter
 from supabase_client import SupabaseManager
 from utils import extract_enhanced_features  # Enhanced landmarks and engineered features
+from emotion_detection import EmotionDetector
 
 # ── Optional: PIL for Unicode (Tamil) text rendering ────────────────────
 try:
@@ -89,10 +91,60 @@ SCALER_PATH = os.path.join("models", "scaler.pkl")
 # Compatibility / Feature mode indicator
 MODEL_EXPECTS_ENHANCED = False
 
+# ── MediaPipe Hand Tracking Configuration ──────────────────────────────────
+# static_image_mode=False: enables tracking mode — faster because it reuses
+#   previous frame landmarks instead of running full detection every frame.
+MP_STATIC_IMAGE_MODE = False
+
+# max_num_hands=1: restricts to single hand — reduces computation and prevents
+#   the detector from splitting attention between hands.
+MP_MAX_NUM_HANDS = 1
+
+# min_detection_confidence=0.70: lower threshold keeps the fast tracking path active
+#   more often, avoiding expensive full-frame re-detection. Tradeoff: speed > strictness.
+MP_MIN_DETECTION_CONFIDENCE = 0.70
+
+# min_tracking_confidence=0.70: lower threshold maintains tracking continuity,
+#   preventing frequent re-detection that adds latency. Tradeoff: speed > strictness.
+MP_MIN_TRACKING_CONFIDENCE = 0.70
+
+# ── Adaptive EMA Landmark Smoothing Configuration ───────────────────────────
+# Motion-adaptive smoothing: low alpha = more smoothing, high alpha = more responsive.
+# When hand is stationary → alpha_slow (stable, reduces jitter)
+# When hand moves quickly  → alpha_fast (near-raw, eliminates lag)
+EMA_ALPHA_SLOW = 0.4          # Smoothing alpha when hand is stationary
+EMA_ALPHA_FAST = 0.9          # Smoothing alpha when hand moves fast
+EMA_SPEED_THRESHOLD = 0.01    # Landmark displacement threshold for fast mode
+
+# ── Hysteresis Configuration ───────────────────────────────────────────────
+# HAND_MISSING_GRACE_FRAMES=5: continue displaying last valid landmarks for
+#   up to 5 frames after MediaPipe loses detection. Prevents flickering.
+HAND_MISSING_GRACE_FRAMES = 5
+
+# ── Emotion Detection Throttle ─────────────────────────────────────────────
+# EMOTION_DETECT_INTERVAL=30: only send frames to emotion detector every 30 frames.
+EMOTION_DETECT_INTERVAL = 30
+
+# ── Webcam Resolution ──────────────────────────────────────────────────────
+WEBCAM_WIDTH = 640
+WEBCAM_HEIGHT = 480
+
+# ── Motion Detection ───────────────────────────────────────────────────────
+# MOTION_THRESHOLD=0.015: average inter-frame landmark displacement above this
+#   value indicates the hand is moving. Pauses prediction to avoid noise.
+MOTION_THRESHOLD = 0.015
+
+# ── Hand Quality Thresholds ────────────────────────────────────────────────
+HAND_EDGE_MARGIN = 0.02          # 2% margin from frame edges
+HAND_MIN_BBOX_SIZE = 0.12        # minimum bounding box dimension (12% of frame)
+HAND_MIN_LANDMARK_SPREAD = 0.02   # minimum std-dev of landmark positions
+STABILITY_BUFFER_SIZE = 10
+STABILITY_MAX_VARIANCE = 0.005
+
 # ── Temporal Logic Configuration ────────────────────────────────────────────
-HISTORY_SIZE = 20             # Number of frames to keep in prediction history
+HISTORY_SIZE = 10             # Number of frames for majority voting (reduced from 30 for responsiveness)
 CONSISTENCY_THRESHOLD = 0.80  # >80% of history must agree for a "stable" prediction
-CONFIDENCE_THRESHOLD = 0.95   # Model confidence must exceed 95%
+CONFIDENCE_THRESHOLD = 0.90   # Model confidence must exceed 90%
 HOLD_TIME_REQUIRED = 0.5      # Seconds the prediction must be held before committing
 FEEDBACK_DISPLAY_DURATION = 1.0  # Seconds to show "Added X" confirmation
 
@@ -102,17 +154,19 @@ TTS_VOLUME = 1.0              # 0.0 to 1.0
 AUTO_CLEAR = True             # Clear sentence buffer automatically after speaking
 
 # ── Colours (BGR) ───────────────────────────────────────────────────────────
-BG_DARK = (30, 30, 46)        # dark panel background
-TEAL = (208, 194, 0)          # teal accent  (#00C2D0)
-TEAL_LIGHT = (220, 220, 80)   # lighter teal
+BG_DARK = (30, 20, 20)            # Deep obsidian slate (semi-transparent)
+BORDER_COLOR = (120, 40, 90)      # Neon dark purple outline
+ACCENT_COLOR = (208, 194, 0)      # Neon Cyan/Teal accent
+TEAL = (208, 194, 0)              # Neon Cyan
+TEAL_LIGHT = (230, 220, 100)      # Light Cyan
 WHITE = (255, 255, 255)
-GREEN = (100, 220, 100)
-RED = (80, 80, 255)
-YELLOW = (60, 220, 255)
-GRAY = (160, 160, 160)
-ORANGE = (50, 160, 255)
+GREEN = (100, 255, 100)           # Cyber lime green
+RED = (80, 80, 255)               # Warning red
+YELLOW = (60, 220, 255)           # Alert orange/yellow
+GRAY = (140, 140, 140)
+ORANGE = (30, 140, 255)           # Electric orange
 CYAN = (255, 255, 0)
-PURPLE = (200, 100, 200)
+PURPLE = (220, 80, 220)           # Tech purple
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -212,6 +266,100 @@ TRANSLATION_DICT = {
 }
 
 
+# ── Tamil Phonetic Transliteration Dictionary (Fallback for missing Tamil TTS voice) ────
+TAMIL_PHONETIC_DICT = {
+    "வணக்கம்": "vanakkam",
+    "நன்றி": "nandri",
+    "தயவுசெய்து": "dhayavu seidhu",
+    "ஆம்": "aamaam",
+    "இல்லை": "illai",
+    "போய் வருகிறேன்": "poi varugiren",
+    "மன்னிக்கவும்": "mannikkavum",
+    "உதவி": "udhavi",
+    "நான் உன்னை காதலிக்கிறேன்": "naan unnai kaadhalikkiren",
+    "காலை வணக்கம்": "kaalai vanakkam",
+    "இரவு வணக்கம்": "iravu vanakkam",
+    "வரவேற்கிறோம்": "varaverkirom",
+    "நீங்கள் எப்படி இருக்கிறீர்கள்": "neenga eppadi irukeenga",
+    "நலம்": "nalam",
+    "என் பெயர்": "en peyar",
+    "என்ன": "enna",
+    "ஏன்": "aen",
+    "எப்போது": "eppodhu",
+    "எங்கே": "engae",
+    "யார்": "yaar",
+    "எப்படி": "eppadi",
+    "என்": "en",
+    "உங்கள்": "ungal",
+    "பெயர்": "peyar",
+    "அப்பா": "appa",
+    "அம்மா": "amma",
+    "சகோதரர்": "sagodharar",
+    "சகோதரி": "sagodhiri",
+    "நண்பர்": "nanbar",
+    "தண்ணீர்": "thanneer",
+    "உணவு": "unavu",
+    "வீடு": "veedu",
+    "பள்ளி": "palli",
+    "புத்தகம்": "puthagam",
+    "பேனா": "pena",
+    "சரி": "sari",
+    "நிறுத்து": "niruthu",
+    "செல்": "sel",
+    "வா": "vaa",
+    "உட்கார்": "utkaar",
+    "எழுந்திரு": "ezhundhiru",
+    "சாப்பிடு": "saapidu",
+    "குடி": "kudi",
+    "தூங்கு": "thoongu",
+    "அன்பு": "anbu",
+    "மகிழ்ச்சி": "magizhchi",
+    "சோகம்": "sogam",
+    "பெரிய": "periya",
+    "சிறிய": "siriya",
+    "சூடான": "soodana",
+    "குளிர்": "kulir",
+    "அவசர உதவி கோரப்பட்டுள்ளது": "avasara udhavi khorappattulladhu",
+}
+
+def transliterate_tamil_text(text: str) -> str:
+    """
+    Transliterates Tamil Unicode text into Romanized phonetic English fallback
+    so that default English TTS voices can read them audibly.
+    """
+    if not text:
+        return text
+        
+    cleaned = text.strip()
+    # Check direct match
+    if cleaned in TAMIL_PHONETIC_DICT:
+        return TAMIL_PHONETIC_DICT[cleaned]
+        
+    # Split text into words/phrases and check
+    words = cleaned.split()
+    romanized_words = []
+    for word in words:
+        stripped = word.strip(".,!?\"'()[]{}")
+        if stripped in TAMIL_PHONETIC_DICT:
+            romanized_words.append(TAMIL_PHONETIC_DICT[stripped])
+        else:
+            # Find if this Tamil word corresponds to any English word in our translation dict
+            found_eng = None
+            for eng_k, tamil_v in TRANSLATION_DICT.get("Tamil", {}).items():
+                if tamil_v == stripped:
+                    found_eng = eng_k
+                    break
+            if found_eng:
+                # Use phonetic version of the English word or just the English word itself
+                romanized_words.append(found_eng.lower())
+            else:
+                pass
+                
+    if romanized_words:
+        return " ".join(romanized_words)
+    return ""
+
+
 # ── Global Translator & Cache for Real-Time Translation ──────────────────────
 _google_translator = None
 _translation_cache = {}
@@ -248,8 +396,10 @@ def translate_to_tamil(text: str) -> str:
         if result and result.text:
             _translation_cache[cleaned_text] = result.text
             return result.text
+        else:
+            print("[ERROR] Tamil Translation Failed")
     except Exception as e:
-        print(f"[WARN] googletrans translation failed: {e}")
+        print(f"[ERROR] Tamil Translation Failed: {e}")
 
     # Cache original text on failure to prevent spamming the API on every frame
     _translation_cache[cleaned_text] = text
@@ -425,7 +575,13 @@ class SpeechEngine:
             except queue.Empty:
                 continue
 
-            text, language, volume = request
+            # Unpack request safely for backward compatibility
+            req_data = request
+            if len(req_data) == 4:
+                text, language, volume, english_fallback = req_data
+            else:
+                text, language, volume = req_data
+                english_fallback = ""
 
             # Update state to SPEAKING
             with self._status_lock:
@@ -438,29 +594,97 @@ class SpeechEngine:
             worker_alive = self._worker_thread.is_alive()
             print(f"[DEBUG TTS] Worker Alive: {worker_alive} | Queue Size: {self._queue.qsize()} | Status: {self._status} | is_speaking: {self._is_speaking_val}")
 
+            # Verify Tamil text reaches the speech engine
+            try:
+                print(f"[DEBUG] Language: {language}")
+                print(f"[DEBUG] Text To Speak: {text}")
+            except Exception:
+                try:
+                    print(f"[DEBUG] Language: {language}")
+                    print(f"[DEBUG] Text To Speak: {text.encode('utf-8', errors='replace')}")
+                except Exception:
+                    pass
+
             try:
                 # Set dynamic volume override
                 engine.setProperty("volume", volume if volume is not None else TTS_VOLUME)
 
                 # Attempt Tamil voice selection if requested
                 if language == "Tamil":
+                    tamil_tts_success = False
+                    temp_file_path = "temp.mp3"
+
+                    # 1. Attempt Tamil Audio Generation using gTTS
                     try:
-                        voices = engine.getProperty("voices")
-                        tamil_voice_found = False
-                        for voice in voices:
-                            voice_name = voice.name.lower() if hasattr(voice, 'name') else ""
-                            voice_id = voice.id.lower() if hasattr(voice, 'id') else ""
-                            if 'tamil' in voice_name or 'ta' in voice_id or 'ta-in' in voice_id:
-                                engine.setProperty("voice", voice.id)
-                                print("[TTS] Tamil voice selected.")
-                                tamil_voice_found = True
-                                break
-                        if not tamil_voice_found:
-                            print("[TTS] Tamil voice not found, using default voice.")
-                    except Exception as ve:
-                        print(f"[TTS] Tamil voice selection error: {ve}")
+                        from gtts import gTTS
+                        tts_obj = gTTS(text=text, lang="ta")
+                        tts_obj.save(temp_file_path)
+                    except Exception as e:
+                        print(f"[ERROR] Tamil Audio Generation Failed: {e}")
+
+                    # 2. Attempt Playback using pygame
+                    if os.path.exists(temp_file_path):
+                        try:
+                            import pygame
+                            if not pygame.mixer.get_init():
+                                pygame.mixer.init()
+                            pygame.mixer.music.load(temp_file_path)
+                            print("[DEBUG] Speech Started")
+                            pygame.mixer.music.play()
+                            while pygame.mixer.music.get_busy():
+                                time.sleep(0.05)
+                            pygame.mixer.music.stop()
+                            try:
+                                pygame.mixer.music.unload()
+                            except Exception:
+                                pass
+                            pygame.mixer.quit()
+                            print("[DEBUG] Speech Finished")
+                            tamil_tts_success = True
+                        except Exception as e:
+                            print(f"[ERROR] Tamil Playback Failed: {e}")
+                        finally:
+                            # Wait for audio playback to finish before deleting temp.mp3
+                            for _ in range(5):
+                                try:
+                                    if os.path.exists(temp_file_path):
+                                        os.remove(temp_file_path)
+                                    break
+                                except Exception:
+                                    time.sleep(0.1)
+
+                    # 3. Fallback: Speak transliterated Tamil using English voice if gTTS/pygame failed
+                    if not tamil_tts_success:
+                        print("[TTS] Tamil TTS failed. Falling back to phonetic transliteration...")
+                        phonetic_text = transliterate_tamil_text(text)
+                        if phonetic_text and phonetic_text.strip():
+                            fallback_text = phonetic_text
+                            print(f"[TTS] Using phonetic Tamil transliteration: {fallback_text}")
+                        elif english_fallback and english_fallback.strip():
+                            fallback_text = english_fallback
+                            print(f"[TTS] Transliteration empty. Using English fallback: {fallback_text}")
+                        else:
+                            fallback_text = text
+                            print("[TTS] Transliteration empty and no English fallback. Playing original Tamil.")
+
+                        # Reset voice to default English
+                        try:
+                            voices = engine.getProperty("voices")
+                            for voice in voices:
+                                voice_name = voice.name.lower() if hasattr(voice, 'name') else ""
+                                if 'tamil' not in voice_name:
+                                    engine.setProperty("voice", voice.id)
+                                    break
+                        except Exception:
+                            pass
+
+                        print("[DEBUG] Speech Started")
+                        engine.say(fallback_text)
+                        engine.runAndWait()
+                        print("[DEBUG] Speech Finished")
+
                 else:
-                    # Reset voice to default (usually English)
+                    # Reset voice to default English
                     try:
                         voices = engine.getProperty("voices")
                         for voice in voices:
@@ -471,10 +695,10 @@ class SpeechEngine:
                     except Exception:
                         pass
 
-                print("[DEBUG] Speech Started")
-                engine.say(text)
-                engine.runAndWait()
-                print("[DEBUG] Speech Finished")
+                    print("[DEBUG] Speech Started")
+                    engine.say(text)
+                    engine.runAndWait()
+                    print("[DEBUG] Speech Finished")
 
             except Exception as e:
                 print(f"[ERROR] Exception during speech execution: {e}")
@@ -535,7 +759,7 @@ class SpeechEngine:
                 return True
             return False
 
-    def speak(self, text: str, language: str = "English", volume: float = None) -> bool:
+    def speak(self, text: str, language: str = "English", volume: float = None, english_fallback: str = "") -> bool:
         """
         Queue a speech request to be processed by the background worker thread.
 
@@ -543,6 +767,7 @@ class SpeechEngine:
             text: The text to speak.
             language: Language for TTS voice selection ("English" or "Tamil").
             volume: Volume level override (0.0 to 1.0).
+            english_fallback: English equivalent to speak if target language TTS is unavailable.
 
         Returns True if the request was accepted (queued), False if rejected (empty text).
         """
@@ -554,7 +779,7 @@ class SpeechEngine:
         clean_text = text.strip()
 
         # Push to the thread-safe queue
-        self._queue.put((clean_text, language, volume))
+        self._queue.put((clean_text, language, volume, english_fallback))
         print("[DEBUG] Queue Accepted")
         
         # Diagnostic logs on the main thread after queuing
@@ -860,23 +1085,37 @@ def check_hand_quality(hand_landmarks):
     Checks if the hand landmarks meet quality criteria (Phase 7):
       - Not too close to the edge (within 2% margin)
       - Not too small (bounding box width and height >= 12% of screen)
+      - Has valid coordinates (no NaNs or infinite numbers)
+      - Has sufficient spread (not collapsed to a single point)
     """
-    xs = [lm.x for lm in hand_landmarks.landmark]
-    ys = [lm.y for lm in hand_landmarks.landmark]
-    
-    # 1. Edge check
-    edge_margin = 0.02
+    # 1. NaN and infinite check
+    coords = []
+    xs = []
+    ys = []
+    for lm in hand_landmarks.landmark:
+        if not np.isfinite(lm.x) or not np.isfinite(lm.y) or not np.isfinite(lm.z):
+            return False, "Invalid Coordinates"
+        xs.append(lm.x)
+        ys.append(lm.y)
+        coords.append([lm.x, lm.y])
+
+    # 2. Edge check
     for x, y in zip(xs, ys):
-        if x < edge_margin or x > (1.0 - edge_margin) or y < edge_margin or y > (1.0 - edge_margin):
+        if x < HAND_EDGE_MARGIN or x > (1.0 - HAND_EDGE_MARGIN) or y < HAND_EDGE_MARGIN or y > (1.0 - HAND_EDGE_MARGIN):
             return False, "Hand Too Close to Edge"
-            
-    # 2. Size check
+
+    # 3. Size check
     bbox_w = max(xs) - min(xs)
     bbox_h = max(ys) - min(ys)
-    min_size = 0.12
-    if bbox_w < min_size or bbox_h < min_size:
+    if bbox_w < HAND_MIN_BBOX_SIZE or bbox_h < HAND_MIN_BBOX_SIZE:
         return False, "Hand Too Small / Far"
-        
+
+    # 4. Spread check (standard deviation of landmarks)
+    coords = np.array(coords, dtype=np.float32)
+    std_dev = np.std(coords, axis=0)
+    if np.any(std_dev < HAND_MIN_LANDMARK_SPREAD):
+        return False, "Hand Configuration Jumbled"
+
     return True, "OK"
 
 
@@ -895,50 +1134,156 @@ def calculate_hand_movement(current_landmarks, prev_landmarks_pts) -> float:
     return float(np.mean(distances))
 
 
-def draw_rounded_rect(img, pt1, pt2, color, radius=18, thickness=-1, alpha=0.7):
-    """Draw a filled rounded rectangle with transparency."""
+class AdaptiveLandmarkSmoother:
+    """
+    Motion-adaptive EMA landmark smoother.
+
+    When hand is stationary → alpha = EMA_ALPHA_SLOW (smoother, reduces jitter)
+    When hand is moving fast → alpha = EMA_ALPHA_FAST (near-raw, eliminates lag)
+
+    Formula: smoothed = alpha * current + (1 - alpha) * previous
+    """
+    def __init__(self, alpha_slow=EMA_ALPHA_SLOW, alpha_fast=EMA_ALPHA_FAST,
+                 speed_threshold=EMA_SPEED_THRESHOLD):
+        self.alpha_slow = alpha_slow
+        self.alpha_fast = alpha_fast
+        self.speed_threshold = speed_threshold
+        self.prev_landmarks = None
+        self.current_alpha = alpha_fast  # Expose for debug panel
+
+    def smooth(self, hand_landmarks):
+        """
+        Applies motion-adaptive EMA smoothing to landmark coordinates in-place.
+        Returns the modified hand_landmarks object.
+        """
+        current = np.array(
+            [[lm.x, lm.y, lm.z] for lm in hand_landmarks.landmark],
+            dtype=np.float32
+        )
+
+        if self.prev_landmarks is None:
+            self.prev_landmarks = current.copy()
+            self.current_alpha = self.alpha_fast
+            return hand_landmarks
+
+        # Compute per-landmark speed (average 2D displacement)
+        speed = float(np.mean(np.linalg.norm(
+            current[:, :2] - self.prev_landmarks[:, :2], axis=1
+        )))
+
+        # Adaptive alpha: fast motion → high alpha (responsive), slow → low alpha (smooth)
+        self.current_alpha = self.alpha_fast if speed > self.speed_threshold else self.alpha_slow
+
+        smoothed = self.current_alpha * current + (1.0 - self.current_alpha) * self.prev_landmarks
+        self.prev_landmarks = smoothed.copy()
+
+        # Modify coordinates in place
+        for i, lm in enumerate(hand_landmarks.landmark):
+            lm.x = float(smoothed[i, 0])
+            lm.y = float(smoothed[i, 1])
+            lm.z = float(smoothed[i, 2])
+
+        return hand_landmarks
+
+    def reset(self):
+        self.prev_landmarks = None
+        self.current_alpha = self.alpha_fast
+
+
+def calculate_stability_score(stability_buffer, max_variance=STABILITY_MAX_VARIANCE):
+    """
+    Computes a stability score from 0 to 100 based on the variance of the 21 landmarks
+    over a rolling queue of the last N frames.
+    """
+    if len(stability_buffer) < 2:
+        return 100  # Assume fully stable if we don't have enough frames yet
+    
+    # stability_buffer contains arrays of shape (21, 2)
+    frames = np.array(list(stability_buffer), dtype=np.float32)  # Shape: (num_frames, 21, 2)
+    
+    # Calculate the variance of each landmark over time (axis=0)
+    # Then take the mean variance across all landmarks and dimensions (x, y)
+    variance = float(np.mean(np.var(frames, axis=0)))
+    
+    # Map variance to a 0–100 score: 0 variance = 100 score, max_variance = 0 score
+    score = max(0, min(100, int(100 * (1.0 - variance / max_variance))))
+    return score
+
+
+def draw_rounded_rect(img, pt1, pt2, color, radius=18, thickness=-1, alpha=0.7, border_color=None, border_thickness=1, accent_color=None):
+    """
+    Draw a filled rounded rectangle with transparency, anti-aliased borders, and a left accent line.
+    """
     overlay = img.copy()
     x1, y1 = pt1
     x2, y2 = pt2
-
-    # Draw rectangle body
+    
+    # Ensure radius is non-negative and doesn't exceed dimensions
+    radius = max(0, min(radius, abs(x2 - x1) // 2, abs(y2 - y1) // 2))
+    
+    # Draw body
     cv2.rectangle(overlay, (x1 + radius, y1), (x2 - radius, y2), color, thickness)
     cv2.rectangle(overlay, (x1, y1 + radius), (x2, y2 - radius), color, thickness)
-
+    
     # Draw corners
-    cv2.ellipse(overlay, (x1 + radius, y1 + radius), (radius, radius), 180, 0, 90, color, thickness)
-    cv2.ellipse(overlay, (x2 - radius, y1 + radius), (radius, radius), 270, 0, 90, color, thickness)
-    cv2.ellipse(overlay, (x1 + radius, y2 - radius), (radius, radius), 90, 0, 90, color, thickness)
-    cv2.ellipse(overlay, (x2 - radius, y2 - radius), (radius, radius), 0, 0, 90, color, thickness)
-
-    cv2.addWeighted(overlay, alpha, img, 1 - alpha, 0, img)
+    for c in [(x1 + radius, y1 + radius, 180), (x2 - radius, y1 + radius, 270),
+              (x1 + radius, y2 - radius, 90), (x2 - radius, y2 - radius, 0)]:
+        cv2.ellipse(overlay, (c[0], c[1]), (radius, radius), c[2], 0, 90, color, thickness)
+        
+    cv2.addWeighted(overlay, alpha, img, 1.0 - alpha, 0, img)
+    
+    # Draw border
+    if border_color is not None:
+        cv2.line(img, (x1 + radius, y1), (x2 - radius, y1), border_color, border_thickness, cv2.LINE_AA)
+        cv2.line(img, (x1 + radius, y2), (x2 - radius, y2), border_color, border_thickness, cv2.LINE_AA)
+        cv2.line(img, (x1, y1 + radius), (x1, y2 - radius), border_color, border_thickness, cv2.LINE_AA)
+        cv2.line(img, (x2, y2 - radius), (x2, y1 + radius), border_color, border_thickness, cv2.LINE_AA)
+        for c in [(x1 + radius, y1 + radius, 180), (x2 - radius, y1 + radius, 270),
+                  (x1 + radius, y2 - radius, 90), (x2 - radius, y2 - radius, 0)]:
+            cv2.ellipse(img, (c[0], c[1]), (radius, radius), c[2], 0, 90, border_color, border_thickness, cv2.LINE_AA)
+            
+    # Draw accent stripe
+    if accent_color is not None:
+        stripe_offset = 6
+        cv2.line(img, (x1 + stripe_offset, y1 + radius), (x1 + stripe_offset, y2 - radius), accent_color, 3, cv2.LINE_AA)
 
 
 def draw_confidence_bar(img, x, y, w, h, confidence, color):
-    """Draw a sleek confidence bar."""
-    # Background bar
-    cv2.rectangle(img, (x, y), (x + w, y + h), (50, 50, 60), -1)
-    cv2.rectangle(img, (x, y), (x + w, y + h), (80, 80, 90), 1)
-    # Filled portion
+    """Draw a pill-shaped progress bar using anti-aliased lines."""
+    if h % 2 != 0:
+        h += 1
+    radius = h // 2
+    p1 = (x + radius, y + radius)
+    p2 = (x + w - radius, y + radius)
+    
+    # Background line
+    cv2.line(img, p1, p2, (40, 40, 50), h, cv2.LINE_AA)
+    
+    # Foreground line
     fill_w = int(w * confidence)
-    if fill_w > 0:
-        cv2.rectangle(img, (x + 1, y + 1), (x + fill_w - 1, y + h - 1), color, -1)
+    if fill_w >= h:
+        cv2.line(img, p1, (x + radius + int((w - 2 * radius) * confidence), y + radius), color, h - 2, cv2.LINE_AA)
+    elif fill_w > 0:
+        cv2.circle(img, p1, radius - 1, color, -1, cv2.LINE_AA)
 
 
 def draw_hold_progress_bar(img, x, y, w, h, progress, color):
-    """Draw an animated hold-time progress bar with a glow effect."""
-    # Background track
-    cv2.rectangle(img, (x, y), (x + w, y + h), (40, 40, 50), -1)
-    cv2.rectangle(img, (x, y), (x + w, y + h), (70, 70, 80), 1)
-
+    """Draw a pill-shaped hold progress bar using anti-aliased lines."""
+    if h % 2 != 0:
+        h += 1
+    radius = h // 2
+    p1 = (x + radius, y + radius)
+    p2 = (x + w - radius, y + radius)
+    
+    # Background line
+    cv2.line(img, p1, p2, (30, 30, 40), h, cv2.LINE_AA)
+    
+    # Foreground line
     fill_w = int(w * min(progress, 1.0))
-    if fill_w > 0:
-        # Main fill
-        cv2.rectangle(img, (x + 1, y + 1), (x + fill_w - 1, y + h - 1), color, -1)
-        # Bright leading edge (glow)
-        edge_x = x + fill_w - 1
-        if edge_x > x + 2:
-            cv2.line(img, (edge_x, y + 1), (edge_x, y + h - 1), WHITE, 1)
+    if fill_w >= h:
+        cv2.line(img, p1, (x + radius + int((w - 2 * radius) * progress), y + radius), color, h - 2, cv2.LINE_AA)
+    elif fill_w > 0:
+        cv2.circle(img, p1, radius - 1, color, -1, cv2.LINE_AA)
 
 
 def draw_hud(frame, prediction, confidence, probabilities, label_names,
@@ -953,27 +1298,39 @@ def draw_hud(frame, prediction, confidence, probabilities, label_names,
       - is_holding: True if currently counting down the hold timer
       - locked_until_reset: True if waiting for hand-reset
       - feedback_message: e.g. "Added A" (or None)
+      - tracking_status: "ACTIVE", "LOST", or "RECOVERING"
+      - stability_score: 0-100 score indicating landmark stability
+      - current_emotion: active emotion from detector
+      - emotion_confidence: emotion prediction confidence
+      - emergency_count_today: number of emergency events logged today
 
     Args:
         selected_language: Current language mode ("English" or "Tamil").
         translated_text: Tamil translation of the sentence buffer (Tamil mode only).
     """
     h, w = frame.shape[:2]
+    
+    # Dynamic HUD scaling factor based on resolution width
+    u_scale = 1.0 if w >= 1000 else 0.75
+    margin = int(15 * u_scale)
+    border_thickness = max(1, int(1.2 * u_scale))
 
     # ── Top-left: Title bar ─────────────────────────────────────────────────
-    draw_rounded_rect(frame, (10, 10), (560, 55), BG_DARK, radius=12, alpha=0.85)
-    cv2.putText(frame, "ASL Sign Language", (24, 42),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.7, TEAL, 2, cv2.LINE_AA)
+    title_w = int(520 * u_scale)
+    title_h = int(50 * u_scale)
+    draw_rounded_rect(frame, (margin, margin), (margin + title_w, margin + title_h),
+                      BG_DARK, radius=12, alpha=0.85, border_color=BORDER_COLOR,
+                      border_thickness=border_thickness, accent_color=ACCENT_COLOR)
+    
+    cv2.putText(frame, "VISION-SPEAK ASL", (margin + int(20 * u_scale), margin + int(33 * u_scale)),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.65 * u_scale, TEAL, max(1, int(2 * u_scale)), cv2.LINE_AA)
 
     # Language indicator
     lang_color = TEAL if selected_language == "English" else ORANGE
-    cv2.putText(frame, f"Language: {selected_language}", (220, 42),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.48, lang_color, 1, cv2.LINE_AA)
+    cv2.putText(frame, f"Lang: {selected_language}", (margin + int(240 * u_scale), margin + int(32 * u_scale)),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.48 * u_scale, lang_color, max(1, int(1 * u_scale)), cv2.LINE_AA)
 
-    cv2.putText(frame, f"FPS: {fps:.0f}", (390, 42),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.5, GRAY, 1, cv2.LINE_AA)
-
-    # Speech status indicator (top bar, right of FPS)
+    # Speech status indicator
     if speech_status == SpeechEngine.STATUS_SPEAKING:
         status_color = ORANGE
         status_icon = ">> SPEAKING"
@@ -983,180 +1340,248 @@ def draw_hud(frame, prediction, confidence, probabilities, label_names,
     else:
         status_color = GRAY
         status_icon = "TTS READY"
-    cv2.putText(frame, status_icon, (400, 42),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.38, status_color, 1, cv2.LINE_AA)
+    cv2.putText(frame, status_icon, (margin + int(390 * u_scale), margin + int(32 * u_scale)),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.42 * u_scale, status_color, max(1, int(1 * u_scale)), cv2.LINE_AA)
+
+    # ── Mid-left: Debug Diagnostics Panel ──────────────────────────────────
+    debug_x = margin
+    debug_y = margin + title_h + int(12 * u_scale)
+    debug_w = int(240 * u_scale)
+    debug_h = int(220 * u_scale)
+    draw_rounded_rect(frame, (debug_x, debug_y), (debug_x + debug_w, debug_y + debug_h),
+                      BG_DARK, radius=12, alpha=0.85, border_color=BORDER_COLOR,
+                      border_thickness=border_thickness, accent_color=PURPLE)
+    
+    cv2.putText(frame, "SYSTEM DIAGNOSTICS", (debug_x + int(15 * u_scale), debug_y + int(24 * u_scale)),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.45 * u_scale, PURPLE, max(1, int(1 * u_scale)), cv2.LINE_AA)
+
+    y_off = debug_y + int(52 * u_scale)
+    # Render FPS
+    cv2.putText(frame, f"FPS: {fps:.1f}", (debug_x + int(15 * u_scale), y_off),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.45 * u_scale, WHITE, max(1, int(1 * u_scale)), cv2.LINE_AA)
+
+    # Render Tracking Status
+    tracking_status = state.get("tracking_status", "LOST")
+    if tracking_status == "ACTIVE":
+        track_color = GREEN
+        track_label = "[● ACTIVE]"
+    elif tracking_status == "RECOVERING":
+        track_color = YELLOW
+        track_label = "[◐ RECOVERY]"
+    else:
+        track_color = RED
+        track_label = "[○ LOST]"
+    cv2.putText(frame, f"Track: {track_label}", (debug_x + int(15 * u_scale), y_off + int(24 * u_scale)),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.45 * u_scale, track_color, max(1, int(1 * u_scale)), cv2.LINE_AA)
+
+    # Render Prediction Confidence
+    cv2.putText(frame, f"Conf: {confidence * 100:.1f}%", (debug_x + int(15 * u_scale), y_off + int(48 * u_scale)),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.45 * u_scale, WHITE, max(1, int(1 * u_scale)), cv2.LINE_AA)
+
+    # Render Emotion Status
+    emotion_str = state.get("current_emotion", "Neutral")
+    emotion_conf = state.get("emotion_confidence", 0.0)
+    cv2.putText(frame, f"Emotion: {emotion_str} ({emotion_conf*100:.0f}%)", (debug_x + int(15 * u_scale), y_off + int(72 * u_scale)),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.42 * u_scale, WHITE, max(1, int(1 * u_scale)), cv2.LINE_AA)
+
+    # Render Stability Score
+    stability_score = state.get("stability_score", 100)
+    cv2.putText(frame, f"Stability: {stability_score}/100", (debug_x + int(15 * u_scale), y_off + int(96 * u_scale)),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.45 * u_scale, WHITE, max(1, int(1 * u_scale)), cv2.LINE_AA)
+
+    # Render Process Time (frame processing latency)
+    process_time_ms = state.get("process_time_ms", 0.0)
+    avg_process_time_ms = state.get("avg_process_time_ms", 0.0)
+    pt_color = GREEN if process_time_ms < 50 else (YELLOW if process_time_ms < 80 else RED)
+    cv2.putText(frame, f"Latency: {process_time_ms:.1f}ms", (debug_x + int(15 * u_scale), y_off + int(120 * u_scale)),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.45 * u_scale, pt_color, max(1, int(1 * u_scale)), cv2.LINE_AA)
+    cv2.putText(frame, f"Avg: {avg_process_time_ms:.1f}ms", (debug_x + int(130 * u_scale), y_off + int(120 * u_scale)),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.38 * u_scale, GRAY, max(1, int(1 * u_scale)), cv2.LINE_AA)
+
+    # Render Smoother Alpha
+    smoother_alpha = state.get("smoother_alpha", 0.0)
+    alpha_color = TEAL if smoother_alpha >= 0.7 else YELLOW
+    cv2.putText(frame, f"EMA Alpha: {smoother_alpha:.2f}", (debug_x + int(15 * u_scale), y_off + int(144 * u_scale)),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.45 * u_scale, alpha_color, max(1, int(1 * u_scale)), cv2.LINE_AA)
 
     # ── Main prediction panel (right side) ──────────────────────────────────
-    panel_x = w - 280
-    panel_y = 10
-    panel_w = 270
-    panel_h = 360
+    panel_w = int(280 * u_scale)
+    panel_h = int(370 * u_scale)
+    panel_x = w - panel_w - margin
+    panel_y = margin
     draw_rounded_rect(frame, (panel_x, panel_y),
                       (panel_x + panel_w, panel_y + panel_h),
-                      BG_DARK, radius=14, alpha=0.85)
+                      BG_DARK, radius=14, alpha=0.85, border_color=BORDER_COLOR,
+                      border_thickness=border_thickness, accent_color=TEAL)
 
     if hand_detected:
         status = state.get("hand_status", "OK")
         if status != "OK":
-            # Display Status (e.g., "Hand Not Ready" or "Hand Moving")
+            # Display Status (e.g., "Hand Not Ready" or "Stabilizing Hand...")
+            status_text = "Stabilizing Hand..." if status == "Hand Moving" else status
             status_color = YELLOW if status == "Hand Moving" else RED
-            status_size = cv2.getTextSize(status, cv2.FONT_HERSHEY_SIMPLEX, 0.7, 2)[0]
+            status_size = cv2.getTextSize(status_text, cv2.FONT_HERSHEY_SIMPLEX, 0.65 * u_scale, max(1, int(2 * u_scale)))[0]
             status_x = panel_x + (panel_w - status_size[0]) // 2
-            cv2.putText(frame, status, (status_x, panel_y + 100),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.7, status_color, 2, cv2.LINE_AA)
+            cv2.putText(frame, status_text, (status_x, panel_y + int(120 * u_scale)),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.65 * u_scale, status_color, max(1, int(2 * u_scale)), cv2.LINE_AA)
 
             detail = state.get("hand_status_detail", "")
             if detail:
-                detail_size = cv2.getTextSize(detail, cv2.FONT_HERSHEY_SIMPLEX, 0.45, 1)[0]
+                detail_size = cv2.getTextSize(detail, cv2.FONT_HERSHEY_SIMPLEX, 0.45 * u_scale, max(1, int(1 * u_scale)))[0]
                 detail_x = panel_x + (panel_w - detail_size[0]) // 2
-                cv2.putText(frame, detail, (detail_x, panel_y + 135),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.45, GRAY, 1, cv2.LINE_AA)
+                cv2.putText(frame, detail, (detail_x, panel_y + int(160 * u_scale)),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.45 * u_scale, GRAY, max(1, int(1 * u_scale)), cv2.LINE_AA)
         elif prediction:
-            # Determine prediction display (Unknown if confidence < CONFIDENCE_THRESHOLD)
+            # Determine prediction display (show raw prediction even if low confidence, but draw in RED)
             is_confident = (confidence >= CONFIDENCE_THRESHOLD)
-            display_pred = prediction if is_confident else "Unknown"
+            display_pred = prediction if prediction else ""
             
             # Prediction letter — large
             pred_color = TEAL if is_confident else RED
-            letter_size = cv2.getTextSize(display_pred, cv2.FONT_HERSHEY_SIMPLEX, 2.2 if not is_confident else 3.0, 4)[0]
+            letter_size = cv2.getTextSize(display_pred, cv2.FONT_HERSHEY_SIMPLEX, 3.0 * u_scale, max(1, int(4 * u_scale)))[0]
             letter_x = panel_x + (panel_w - letter_size[0]) // 2
-            cv2.putText(frame, display_pred, (letter_x, panel_y + 80),
-                        cv2.FONT_HERSHEY_SIMPLEX, 2.2 if not is_confident else 3.0, pred_color, 3 if not is_confident else 4, cv2.LINE_AA)
+            cv2.putText(frame, display_pred, (letter_x, panel_y + int(100 * u_scale)),
+                        cv2.FONT_HERSHEY_SIMPLEX, 3.0 * u_scale, pred_color, max(1, int(4 * u_scale)), cv2.LINE_AA)
 
             # Confidence percentage
             conf_text = f"{confidence * 100:.1f}%"
             conf_color = GREEN if is_confident else RED
-            conf_size = cv2.getTextSize(conf_text, cv2.FONT_HERSHEY_SIMPLEX, 0.7, 2)[0]
+            conf_size = cv2.getTextSize(conf_text, cv2.FONT_HERSHEY_SIMPLEX, 0.75 * u_scale, max(1, int(2 * u_scale)))[0]
             conf_x = panel_x + (panel_w - conf_size[0]) // 2
-            cv2.putText(frame, conf_text, (conf_x, panel_y + 110),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.7, conf_color, 2, cv2.LINE_AA)
+            cv2.putText(frame, conf_text, (conf_x, panel_y + int(140 * u_scale)),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.75 * u_scale, conf_color, max(1, int(2 * u_scale)), cv2.LINE_AA)
 
             # Confidence bar
-            draw_confidence_bar(frame, panel_x + 20, panel_y + 120,
-                                panel_w - 40, 14, confidence, conf_color)
+            draw_confidence_bar(frame, panel_x + int(20 * u_scale), panel_y + int(155 * u_scale),
+                                panel_w - int(40 * u_scale), int(14 * u_scale), confidence, conf_color)
 
             # ── Hold-time progress (temporal feedback) ──────────────────────────
-            y_hold = panel_y + 150
+            y_hold = panel_y + int(195 * u_scale)
             if state["is_holding"]:
                 elapsed = state["hold_elapsed"]
                 progress = elapsed / HOLD_TIME_REQUIRED
                 hold_text = f"Hold: {elapsed:.1f} / {HOLD_TIME_REQUIRED:.1f}s"
                 bar_color = GREEN if progress > 0.8 else ORANGE
-                cv2.putText(frame, hold_text, (panel_x + 15, y_hold),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.48, YELLOW, 1, cv2.LINE_AA)
-                draw_hold_progress_bar(frame, panel_x + 20, y_hold + 6,
-                                       panel_w - 40, 12, progress, bar_color)
-                y_hold += 32
+                cv2.putText(frame, hold_text, (panel_x + int(15 * u_scale), y_hold),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.48 * u_scale, YELLOW, max(1, int(1 * u_scale)), cv2.LINE_AA)
+                draw_hold_progress_bar(frame, panel_x + int(20 * u_scale), y_hold + int(8 * u_scale),
+                                       panel_w - int(40 * u_scale), int(12 * u_scale), progress, bar_color)
+                y_hold += int(35 * u_scale)
             elif state["locked_until_reset"]:
                 cv2.putText(frame, "Locked (change sign/remove hand)",
-                            (panel_x + 12, y_hold),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.35, GRAY, 1, cv2.LINE_AA)
-                y_hold += 22
+                            (panel_x + int(12 * u_scale), y_hold),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.38 * u_scale, GRAY, max(1, int(1 * u_scale)), cv2.LINE_AA)
+                y_hold += int(25 * u_scale)
             elif not is_confident:
                 cv2.putText(frame, f"Low confidence (<{CONFIDENCE_THRESHOLD*100:.0f}%)",
-                            (panel_x + 12, y_hold),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.38, RED, 1, cv2.LINE_AA)
-                y_hold += 22
+                            (panel_x + int(12 * u_scale), y_hold),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.40 * u_scale, RED, max(1, int(1 * u_scale)), cv2.LINE_AA)
+                y_hold += int(25 * u_scale)
             else:
-                y_hold += 5  # small gap
+                y_hold += int(10 * u_scale)
 
             # ── Top-3 predictions ───────────────────────────────────────────────
             top_indices = np.argsort(probabilities)[::-1][:3]
-            y_offset = y_hold + 10
-            cv2.putText(frame, "Top Predictions:", (panel_x + 15, y_offset),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.45, GRAY, 1, cv2.LINE_AA)
-            y_offset += 28
+            y_offset = y_hold + int(12 * u_scale)
+            cv2.putText(frame, "Top Predictions:", (panel_x + int(15 * u_scale), y_offset),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.45 * u_scale, GRAY, max(1, int(1 * u_scale)), cv2.LINE_AA)
+            y_offset += int(28 * u_scale)
             for rank, idx in enumerate(top_indices, 1):
                 lbl = label_names[idx]
                 prob = probabilities[idx]
                 bar_color = TEAL if rank == 1 else TEAL_LIGHT
                 text = f"{rank}. {lbl}"
-                cv2.putText(frame, text, (panel_x + 15, y_offset),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.5, WHITE, 1, cv2.LINE_AA)
-                draw_confidence_bar(frame, panel_x + 60, y_offset - 10,
-                                    panel_w - 90, 10, prob, bar_color)
+                cv2.putText(frame, text, (panel_x + int(15 * u_scale), y_offset),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.5 * u_scale, WHITE, max(1, int(1 * u_scale)), cv2.LINE_AA)
+                draw_confidence_bar(frame, panel_x + int(60 * u_scale), y_offset - int(10 * u_scale),
+                                    panel_w - int(90 * u_scale), int(10 * u_scale), prob, bar_color)
                 pct = f"{prob * 100:.1f}%"
-                cv2.putText(frame, pct, (panel_x + panel_w - 55, y_offset),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.38, GRAY, 1, cv2.LINE_AA)
-                y_offset += 28
+                cv2.putText(frame, pct, (panel_x + panel_w - int(55 * u_scale), y_offset),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.38 * u_scale, GRAY, max(1, int(1 * u_scale)), cv2.LINE_AA)
+                y_offset += int(28 * u_scale)
     else:
         # No hand detected
         msg = "No Hand Detected"
-        msg_size = cv2.getTextSize(msg, cv2.FONT_HERSHEY_SIMPLEX, 0.6, 2)[0]
+        msg_size = cv2.getTextSize(msg, cv2.FONT_HERSHEY_SIMPLEX, 0.65 * u_scale, max(1, int(2 * u_scale)))[0]
         msg_x = panel_x + (panel_w - msg_size[0]) // 2
-        cv2.putText(frame, msg, (msg_x, panel_y + 100),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, GRAY, 2, cv2.LINE_AA)
+        cv2.putText(frame, msg, (msg_x, panel_y + int(120 * u_scale)),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.65 * u_scale, GRAY, max(1, int(2 * u_scale)), cv2.LINE_AA)
 
         hint = "Show your hand"
-        hint_size = cv2.getTextSize(hint, cv2.FONT_HERSHEY_SIMPLEX, 0.45, 1)[0]
+        hint_size = cv2.getTextSize(hint, cv2.FONT_HERSHEY_SIMPLEX, 0.45 * u_scale, max(1, int(1 * u_scale)))[0]
         hint_x = panel_x + (panel_w - hint_size[0]) // 2
-        cv2.putText(frame, hint, (hint_x, panel_y + 135),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.45, GRAY, 1, cv2.LINE_AA)
+        cv2.putText(frame, hint, (hint_x, panel_y + int(160 * u_scale)),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.45 * u_scale, GRAY, max(1, int(1 * u_scale)), cv2.LINE_AA)
 
     # ── Emergency events daily counter (always visible at bottom of right panel) ──
     emergency_count = state.get("emergency_count_today", 0)
     counter_text = f"Emergency Events Today: {emergency_count}"
-    cv2.putText(frame, counter_text, (panel_x + 15, panel_y + panel_h - 15),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.42, (80, 80, 255) if emergency_count > 0 else GRAY, 1, cv2.LINE_AA)
+    cv2.putText(frame, counter_text, (panel_x + int(15 * u_scale), panel_y + panel_h - int(15 * u_scale)),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.42 * u_scale, (80, 80, 255) if emergency_count > 0 else GRAY, max(1, int(1 * u_scale)), cv2.LINE_AA)
 
     # ── Feedback banner (e.g. "Added A") ────────────────────────────────────
     if state["feedback_message"]:
         fb_text = state["feedback_message"]
-        fb_size = cv2.getTextSize(fb_text, cv2.FONT_HERSHEY_SIMPLEX, 0.8, 2)[0]
+        fb_size = cv2.getTextSize(fb_text, cv2.FONT_HERSHEY_SIMPLEX, 0.8 * u_scale, max(1, int(2 * u_scale)))[0]
         fb_x = (w - fb_size[0]) // 2
-        fb_y = h // 2 - 40
-        draw_rounded_rect(frame, (fb_x - 20, fb_y - 35),
-                          (fb_x + fb_size[0] + 20, fb_y + 15),
+        fb_y = h // 2 - int(40 * u_scale)
+        draw_rounded_rect(frame, (fb_x - int(20 * u_scale), fb_y - int(35 * u_scale)),
+                          (fb_x + fb_size[0] + int(20 * u_scale), fb_y + int(15 * u_scale)),
                           (20, 100, 20), radius=14, alpha=0.85)
         cv2.putText(frame, fb_text, (fb_x, fb_y),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.8, GREEN, 2, cv2.LINE_AA)
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.8 * u_scale, GREEN, max(1, int(2 * u_scale)), cv2.LINE_AA)
 
-    # ── Tamil translation bar (only visible in Tamil mode) ──────────────────
-    if selected_language == "Tamil" and translated_text:
-        tamil_bar_h = 38
-        tamil_bar_y = h - 55 - 10 - 45 - 8 - tamil_bar_h - 4
-        draw_rounded_rect(frame, (10, tamil_bar_y), (w - 10, tamil_bar_y + tamil_bar_h),
-                          BG_DARK, radius=12, alpha=0.80)
-        cv2.putText(frame, "Tamil:", (24, tamil_bar_y + 26),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.48, ORANGE, 1, cv2.LINE_AA)
-        draw_unicode_text(frame, translated_text,
-                          (90, tamil_bar_y + 4), (ORANGE), font_size=26, thickness=1)
+    # ── Word buffer (bottom bar - base layer for layout calculation) ─────────
+    bar_h = int(58 * u_scale)
+    bar_y = h - bar_h - margin
+    draw_rounded_rect(frame, (margin, bar_y), (w - margin, bar_y + bar_h),
+                      BG_DARK, radius=12, alpha=0.85, border_color=BORDER_COLOR,
+                      border_thickness=border_thickness, accent_color=GRAY)
+
+    cv2.putText(frame, "Word:", (margin + int(15 * u_scale), bar_y + int(36 * u_scale)),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.55 * u_scale, GRAY, max(1, int(1 * u_scale)), cv2.LINE_AA)
+
+    word_text = "".join(word_buffer) if word_buffer else "_"
+    cv2.putText(frame, word_text, (margin + int(75 * u_scale), bar_y + int(38 * u_scale)),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.75 * u_scale, WHITE, max(1, int(2 * u_scale)), cv2.LINE_AA)
+
+    # Controls hint (right-aligned dynamically)
+    controls = "[Q]Quit [C]Clear [L]Lang [SPC]Word [BKSP]Del [ENTER]Speak"
+    controls_size = cv2.getTextSize(controls, cv2.FONT_HERSHEY_SIMPLEX, 0.38 * u_scale, max(1, int(1 * u_scale)))[0]
+    controls_x = w - margin - int(15 * u_scale) - controls_size[0]
+    cv2.putText(frame, controls, (controls_x, bar_y + int(36 * u_scale)),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.38 * u_scale, GRAY, max(1, int(1 * u_scale)), cv2.LINE_AA)
 
     # ── Sentence buffer (second-from-bottom bar) ────────────────────────────
-    sent_bar_h = 45
-    sent_bar_y = h - 55 - 10 - sent_bar_h - 8
-    draw_rounded_rect(frame, (10, sent_bar_y), (w - 10, sent_bar_y + sent_bar_h),
-                      BG_DARK, radius=12, alpha=0.80)
+    sent_bar_h = int(48 * u_scale)
+    sent_bar_y = bar_y - sent_bar_h - int(10 * u_scale)
+    draw_rounded_rect(frame, (margin, sent_bar_y), (w - margin, sent_bar_y + sent_bar_h),
+                      BG_DARK, radius=12, alpha=0.80, border_color=BORDER_COLOR,
+                      border_thickness=border_thickness, accent_color=PURPLE)
 
     # Label changes to "English:" in Tamil mode
     sent_label = "English:" if selected_language == "Tamil" else "Sentence:"
-    cv2.putText(frame, sent_label, (24, sent_bar_y + 30),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.48, PURPLE, 1, cv2.LINE_AA)
+    cv2.putText(frame, sent_label, (margin + int(15 * u_scale), sent_bar_y + int(30 * u_scale)),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.48 * u_scale, PURPLE, max(1, int(1 * u_scale)), cv2.LINE_AA)
 
     sentence_text = " ".join(sentence_buffer) if sentence_buffer else "(press SPACE to finish words)"
     sent_color = WHITE if sentence_buffer else GRAY
-    # Position text slightly to the left if using shorter "English:" label
-    text_x_pos = 100 if selected_language == "Tamil" else 120
-    cv2.putText(frame, sentence_text, (text_x_pos, sent_bar_y + 30),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.55, sent_color, 1, cv2.LINE_AA)
+    text_x_pos = margin + int(75 * u_scale) if selected_language == "Tamil" else margin + int(95 * u_scale)
+    cv2.putText(frame, sentence_text, (text_x_pos, sent_bar_y + int(30 * u_scale)),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.55 * u_scale, sent_color, max(1, int(1 * u_scale)), cv2.LINE_AA)
 
-    # ── Word buffer (bottom bar) ────────────────────────────────────────────
-    bar_h = 55
-    bar_y = h - bar_h - 10
-    draw_rounded_rect(frame, (10, bar_y), (w - 10, bar_y + bar_h),
-                      BG_DARK, radius=12, alpha=0.85)
-
-    cv2.putText(frame, "Word:", (24, bar_y + 35),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.55, GRAY, 1, cv2.LINE_AA)
-
-    word_text = "".join(word_buffer) if word_buffer else "_"
-    cv2.putText(frame, word_text, (90, bar_y + 36),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.75, WHITE, 2, cv2.LINE_AA)
-
-    # Controls hint
-    controls = "[Q]Quit [C]Clear [L]Lang [SPC]Word [BKSP]Del [ENTER]Speak"
-    cv2.putText(frame, controls, (w - 480, bar_y + 36),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.38, GRAY, 1, cv2.LINE_AA)
+    # ── Tamil translation bar (only visible in Tamil mode) ──────────────────
+    if selected_language == "Tamil" and translated_text:
+        tamil_bar_h = int(40 * u_scale)
+        tamil_bar_y = sent_bar_y - tamil_bar_h - int(8 * u_scale)
+        draw_rounded_rect(frame, (margin, tamil_bar_y), (w - margin, tamil_bar_y + tamil_bar_h),
+                          BG_DARK, radius=12, alpha=0.80, border_color=BORDER_COLOR,
+                          border_thickness=border_thickness, accent_color=ORANGE)
+        cv2.putText(frame, "Tamil:", (margin + int(15 * u_scale), tamil_bar_y + int(26 * u_scale)),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.48 * u_scale, ORANGE, max(1, int(1 * u_scale)), cv2.LINE_AA)
+        draw_unicode_text(frame, translated_text,
+                          (margin + int(75 * u_scale), tamil_bar_y + int(4 * u_scale)),
+                          ORANGE, font_size=int(26 * u_scale), thickness=max(1, int(1 * u_scale)))
 
     # ── Emergency Pop-up Modal (drawn on top of all elements) ──────────────────
     if state.get("emergency_active", False):
@@ -1164,36 +1589,35 @@ def draw_hud(frame, prediction, confidence, probabilities, label_names,
         emergency_time = state.get("emergency_trigger_time", time.time())
         emergency_language = state.get("emergency_language", "English")
         
-        alert_w = 480
-        alert_h = 200
+        alert_w = int(480 * u_scale)
+        alert_h = int(200 * u_scale)
         x1 = (w - alert_w) // 2
         y1 = (h - alert_h) // 2
         x2 = x1 + alert_w
         y2 = y1 + alert_h
         
         # Red background panel
-        draw_rounded_rect(frame, (x1, y1), (x2, y2), (50, 50, 255), radius=16, alpha=0.95)
-        # Border outline
-        cv2.rectangle(frame, (x1, y1), (x2, y2), WHITE, 2, cv2.LINE_AA)
+        draw_rounded_rect(frame, (x1, y1), (x2, y2), (50, 50, 255), radius=16, alpha=0.95,
+                          border_color=WHITE, border_thickness=max(1, int(2 * u_scale)))
         
         # Indicator Circle (to simulate 🔴)
-        cv2.circle(frame, (x1 + 35, y1 + 40), 10, (0, 0, 255), -1)
-        cv2.circle(frame, (x1 + 35, y1 + 40), 12, WHITE, 1, cv2.LINE_AA)
+        cv2.circle(frame, (x1 + int(35 * u_scale), y1 + int(40 * u_scale)), int(10 * u_scale), (0, 0, 255), -1)
+        cv2.circle(frame, (x1 + int(35 * u_scale), y1 + int(40 * u_scale)), int(12 * u_scale), WHITE, 1, cv2.LINE_AA)
         
         # Title text
-        cv2.putText(frame, "EMERGENCY DETECTED", (x1 + 60, y1 + 47),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.75, WHITE, 2, cv2.LINE_AA)
+        cv2.putText(frame, "EMERGENCY DETECTED", (x1 + int(60 * u_scale), y1 + int(47 * u_scale)),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.75 * u_scale, WHITE, max(1, int(2 * u_scale)), cv2.LINE_AA)
         
         # Details
-        cv2.putText(frame, f"Detected Keyword: {emergency_keyword}", (x1 + 30, y1 + 95),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, YELLOW, 2, cv2.LINE_AA)
+        cv2.putText(frame, f"Detected Keyword: {emergency_keyword}", (x1 + int(30 * u_scale), y1 + int(95 * u_scale)),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.6 * u_scale, YELLOW, max(1, int(2 * u_scale)), cv2.LINE_AA)
         
         local_time_str = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(emergency_time))
-        cv2.putText(frame, f"Timestamp: {local_time_str}", (x1 + 30, y1 + 135),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.52, WHITE, 1, cv2.LINE_AA)
+        cv2.putText(frame, f"Timestamp: {local_time_str}", (x1 + int(30 * u_scale), y1 + int(135 * u_scale)),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.52 * u_scale, WHITE, max(1, int(1 * u_scale)), cv2.LINE_AA)
         
-        cv2.putText(frame, f"Language: {emergency_language}", (x1 + 30, y1 + 170),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.52, WHITE, 1, cv2.LINE_AA)
+        cv2.putText(frame, f"Language: {emergency_language}", (x1 + int(30 * u_scale), y1 + int(170 * u_scale)),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.52 * u_scale, WHITE, max(1, int(1 * u_scale)), cv2.LINE_AA)
 
 
 # ── Temporal Logic Engine ───────────────────────────────────────────────────
@@ -1248,10 +1672,10 @@ def main():
     mp_styles = mp.solutions.drawing_styles
 
     hands = mp_hands.Hands(
-        static_image_mode=False,
-        max_num_hands=1,
-        min_detection_confidence=0.7,
-        min_tracking_confidence=0.5,
+        static_image_mode=MP_STATIC_IMAGE_MODE,
+        max_num_hands=MP_MAX_NUM_HANDS,
+        min_detection_confidence=MP_MIN_DETECTION_CONFIDENCE,
+        min_tracking_confidence=MP_MIN_TRACKING_CONFIDENCE,
     )
 
     # ── Webcam ──────────────────────────────────────────────────────────────
@@ -1260,13 +1684,21 @@ def main():
         print("[ERROR] Cannot open webcam.")
         sys.exit(1)
 
-    cap.set(cv2.CAP_PROP_FRAME_WIDTH, 1280)
-    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 720)
+    cap.set(cv2.CAP_PROP_FRAME_WIDTH, WEBCAM_WIDTH)
+    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, WEBCAM_HEIGHT)
 
     print("[OK] Webcam opened. Press Q or ESC to quit.\n")
 
     # ── Language State ──────────────────────────────────────────────────────
     selected_language = "English"  # Default: "English" or "Tamil"
+
+    # ── Hand Tracking Stability & Hysteresis State Variables ────────────────
+    landmark_smoother = AdaptiveLandmarkSmoother()
+    emotion_detector = EmotionDetector(detect_every_n=EMOTION_DETECT_INTERVAL)
+    stability_buffer = deque(maxlen=STABILITY_BUFFER_SIZE)
+    hand_missing_frames = 0
+    last_valid_hand_lm = None
+    tracking_status = "LOST"
 
     # ── State Variables (Temporal Logic) ────────────────────────────────────
     word_buffer = deque(maxlen=50)       # Current word being built letter-by-letter
@@ -1311,6 +1743,10 @@ def main():
     prev_time = time.time()
     fps = 0.0
 
+    # Performance tracking (debug panel)
+    process_time_history = deque(maxlen=30)  # Rolling 30-frame average
+    frame_process_time_ms = 0.0
+
     # Hand motion tracking
     prev_landmarks_pts = None
 
@@ -1328,6 +1764,12 @@ def main():
             continue
 
         frame = cv2.flip(frame, 1)  # mirror for natural interaction
+        frame_start_time = time.time()  # Start frame processing timer
+        
+        # Submit frame to emotion detector (Optimization 4)
+        if emotion_detector.enabled:
+            emotion_detector.detect(frame)
+
         rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
         results = hands.process(rgb)
 
@@ -1351,31 +1793,60 @@ def main():
             print("[AUTO-CLEAR] Sentence buffer cleared after speech.")
 
         # ================================================================
-        # HAND DETECTED → run prediction + temporal logic
+        # HAND DETECTED / HYSTERESIS PROCESSING
         # ================================================================
+        hand_lm = None
+        if results.multi_hand_landmarks:
+            hand_lm = results.multi_hand_landmarks[0]
+            hand_missing_frames = 0
+            hand_detected = True
+            
+            # 1. Adaptive EMA Landmark Smoothing (motion-adaptive alpha)
+            hand_lm = landmark_smoother.smooth(hand_lm)
+            
+            # Cache the smoothed landmarks object for grace period
+            last_valid_hand_lm = hand_lm
+            tracking_status = "ACTIVE"
+            
+            # Append 2D coordinates to stability buffer (Optimization 9)
+            stability_buffer.append(np.array([[lm.x, lm.y] for lm in hand_lm.landmark], dtype=np.float32))
+        else:
+            # Hysteresis grace period check (Optimization 3)
+            if last_valid_hand_lm is not None and hand_missing_frames < HAND_MISSING_GRACE_FRAMES:
+                hand_missing_frames += 1
+                hand_detected = True
+                hand_lm = last_valid_hand_lm
+                tracking_status = "RECOVERING"
+                # Do not append to stability buffer during grace period
+            else:
+                tracking_status = "LOST"
+                hand_detected = False
+                hand_lm = None
+                last_valid_hand_lm = None
+                landmark_smoother.reset()
+                stability_buffer.clear()
+
+        # Execute tracking status variables for HUD
         hand_status = "No Hand Detected"
         hand_status_detail = ""
 
-        if results.multi_hand_landmarks:
-            hand_detected = True
-            hand_lm = results.multi_hand_landmarks[0]
-
-            # Draw hand landmarks with styled connections
+        if hand_detected and hand_lm is not None:
+            # Draw smoothed hand landmarks
             mp_draw.draw_landmarks(
                 frame, hand_lm, mp_hands.HAND_CONNECTIONS,
                 mp_styles.get_default_hand_landmarks_style(),
                 mp_styles.get_default_hand_connections_style(),
             )
 
-            # ── Step 1: Hand Quality Check (Phase 7) ─────────────────────
+            # ── Step 1: Hand Quality Check (Optimization 7) ─────────────────
             quality_ok, quality_msg = check_hand_quality(hand_lm)
             
-            # ── Step 2: Motion Check (Phase 6) ───────────────────────────
+            # ── Step 2: Motion Check (Optimization 8) ───────────────────────
             is_moving = False
             movement_val = 0.0
             if prev_landmarks_pts is not None:
                 movement_val = calculate_hand_movement(hand_lm, prev_landmarks_pts)
-                if movement_val > 0.015:
+                if movement_val > MOTION_THRESHOLD:
                     is_moving = True
             # Store current landmarks for next frame motion check
             prev_landmarks_pts = [[lm.x, lm.y] for lm in hand_lm.landmark]
@@ -1392,54 +1863,48 @@ def main():
                 hand_status_detail = f"Speed: {movement_val:.3f}"
                 current_prediction = None
                 confidence = 0.0
-                # Pause the hold timer while hand is moving rapidly
                 hold_timer_start = None
             else:
                 hand_status = "OK"
                 hand_status_detail = ""
 
-                # Extract features based on model expectation (Compatibility Mode)
-                if MODEL_EXPECTS_ENHANCED:
-                    features = extract_enhanced_features(hand_lm).reshape(1, -1)
+                # Only predict on active hand track (not grace period recovery frames)
+                if tracking_status == "ACTIVE":
+                    # Extract features based on model expectation (Compatibility Mode)
+                    if MODEL_EXPECTS_ENHANCED:
+                        features = extract_enhanced_features(hand_lm).reshape(1, -1)
+                    else:
+                        features = extract_landmarks(hand_lm).reshape(1, -1)
+
+                    features_scaled = scaler.transform(features)
+                    current_prediction = le.inverse_transform(model.predict(features_scaled))[0]
+                    probabilities = model.predict_proba(features_scaled)[0]
+                    confidence = float(np.max(probabilities))
+
+                    # ── Step 3: Confidence Filtering ─────────────────────────────
+                    filtered_pred = current_prediction if confidence >= CONFIDENCE_THRESHOLD else None
+                    prediction_history.append(filtered_pred)
                 else:
-                    features = extract_landmarks(hand_lm).reshape(1, -1)
+                    # During recovery, we bypass prediction and clear hold timer to be safe,
+                    # but keep the last prediction visual representation on HUD.
+                    hold_timer_start = None
 
-                features_scaled = scaler.transform(features)
-                current_prediction = le.inverse_transform(model.predict(features_scaled))[0]
-                probabilities = model.predict_proba(features_scaled)[0]
-                confidence = float(np.max(probabilities))
-
-                # ── Step 3: Confidence Filtering (Phase 3) ───────────────────
-                # Only accept predictions with >= 95% confidence
-                filtered_pred = current_prediction if confidence >= CONFIDENCE_THRESHOLD else "Unknown"
-
-                # ── Step 4: Append to prediction history ─────────────────────
-                prediction_history.append(filtered_pred)
-
-                # ── Step 5: Majority voting (Phases 4 & 5) ───────────────────
+                # ── Step 5: Majority voting ───────────────────────────────────
                 stable_prediction, consistency_ratio = get_majority_prediction(
                     prediction_history, CONSISTENCY_THRESHOLD
                 )
 
                 # ── Step 6: Temporal decision logic ──────────────────────────
-                if stable_prediction is not None and stable_prediction != "Unknown":
-                    # We have a consistent, high-confidence prediction
-
+                if stable_prediction is not None:
                     # Check if locked: same letter was just added
                     if locked_until_reset and stable_prediction == last_added_letter:
-                        # LOCKED: user must remove hand or change sign
                         hold_timer_start = None  # don't accumulate hold time
-
                     elif stable_prediction != last_added_letter:
                         # NEW LETTER detected (different from the locked one)
-                        # This automatically unlocks the system
                         locked_until_reset = False
-
                         if hold_timer_start is None:
-                            # Start the hold timer for this new stable prediction
                             hold_timer_start = now
                         else:
-                            # Check if held long enough
                             hold_elapsed = now - hold_timer_start
                             if hold_elapsed >= HOLD_TIME_REQUIRED:
                                 # ── COMMIT THE LETTER ───────────────────────
@@ -1452,10 +1917,7 @@ def main():
                                 # Set feedback
                                 feedback_message = f"Added: {stable_prediction}"
                                 feedback_timestamp = now
-
-                                print(f"[COMMIT] '{stable_prediction}' added. "
-                                      f"Word: {''.join(word_buffer)}")
-
+                                print(f"[COMMIT] '{stable_prediction}' added. Word: {''.join(word_buffer)}")
                     else:
                         # Same letter, but not locked (first occurrence)
                         if hold_timer_start is None:
@@ -1472,17 +1934,11 @@ def main():
 
                                 feedback_message = f"Added: {stable_prediction}"
                                 feedback_timestamp = now
-
-                                print(f"[COMMIT] '{stable_prediction}' added. "
-                                      f"Word: {''.join(word_buffer)}")
+                                print(f"[COMMIT] '{stable_prediction}' added. Word: {''.join(word_buffer)}")
                 else:
-                    # Prediction is unstable, unknown, or low-confidence: reset hold timer
                     hold_timer_start = None
-
-        # ================================================================
-        # NO HAND DETECTED → reset all temporal state
-        # ================================================================
         else:
+            # No hand detected at all (and grace expired)
             hand_status = "No Hand Detected"
             hand_status_detail = ""
             current_prediction = None
@@ -1491,7 +1947,6 @@ def main():
             hold_timer_start = None
             prev_landmarks_pts = None
 
-            # Hand removal resets the lock, allowing the same letter next time
             if locked_until_reset:
                 locked_until_reset = False
                 last_added_letter = None
@@ -1524,12 +1979,14 @@ def main():
                     translated_tamil = translate_to_tamil(text_to_translate)
                     priority_text = "அவசர உதவி கோரப்பட்டுள்ளது. " + translated_tamil
                     speech_lang = "Tamil"
+                    english_fallback = "Emergency assistance requested. " + text_to_translate
                 else:
                     text_to_speak = current_sentence_str if current_sentence_str else current_word_str
                     priority_text = "Emergency assistance requested. " + text_to_speak
                     speech_lang = "English"
+                    english_fallback = ""
                 
-                tts.speak(priority_text, language=speech_lang, volume=1.0)
+                tts.speak(priority_text, language=speech_lang, volume=1.0, english_fallback=english_fallback)
                 
                 # 3. Supabase Log (non-blocking background thread)
                 db_translated = translate_to_tamil(current_sentence_str) if selected_language == "Tamil" else ""
@@ -1557,6 +2014,15 @@ def main():
                 loc = share_location()
                 print(f"[FUTURE READY] Share location: {loc}")
 
+        # ── Get Emotion Result ──────────────────────────────────────────
+        emotion_str = "Neutral"
+        emotion_conf = 0.0
+        if emotion_detector.enabled:
+            emotion_str, emotion_conf = emotion_detector.get_emotion()
+
+        # ── Calculate Hand Stability Score ──────────────────────────────
+        stability_score = calculate_stability_score(stability_buffer)
+
         # ── Compute HUD state dict ──────────────────────────────────────
         hold_elapsed = 0.0
         is_holding = False
@@ -1577,7 +2043,18 @@ def main():
             "emergency_count_today": emergency_count_today,
             "hand_status": hand_status,
             "hand_status_detail": hand_status_detail,
+            "tracking_status": tracking_status,
+            "stability_score": stability_score,
+            "current_emotion": emotion_str,
+            "emotion_confidence": emotion_conf,
+            "process_time_ms": frame_process_time_ms,
+            "avg_process_time_ms": float(np.mean(process_time_history)) if process_time_history else 0.0,
+            "smoother_alpha": landmark_smoother.current_alpha,
         }
+
+        # ── Frame Processing Time ───────────────────────────────────────────
+        frame_process_time_ms = (time.time() - frame_start_time) * 1000.0
+        process_time_history.append(frame_process_time_ms)
 
         # ── FPS ─────────────────────────────────────────────────────────
         fps = 0.8 * fps + 0.2 * (1.0 / max(now - prev_time, 1e-6))
@@ -1672,14 +2149,22 @@ def main():
 
                 if selected_language == "Tamil":
                     speak_text = translated
+                    english_fallback = full_sentence
                     if translated != full_sentence:
-                        print(f"[TAMIL] Translated: {translated}")
+                        try:
+                            print(f"[TAMIL] Translated: {translated}")
+                        except Exception:
+                            try:
+                                print(f"[TAMIL] Translated: {translated.encode('utf-8', errors='replace')}")
+                            except Exception:
+                                pass
                     else:
                         print("[TAMIL] No translation found, speaking English.")
                 else:
                     speak_text = full_sentence
+                    english_fallback = ""
 
-                spoken = tts.speak(speak_text, language=tts_language)
+                spoken = tts.speak(speak_text, language=tts_language, english_fallback=english_fallback)
                 print(f"[DEBUG] speak() returned:\n{spoken}")
                 if spoken:
                     feedback_message = f"Speaking: {full_sentence}"
@@ -1696,6 +2181,7 @@ def main():
                 feedback_timestamp = now
 
     # ── Cleanup ─────────────────────────────────────────────────────────────
+    emotion_detector.shutdown()
     tts.shutdown()
     hands.close()
     cap.release()

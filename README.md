@@ -189,12 +189,12 @@ Since the system uses **flat-file storage**, the logical entity model maps as fo
 
 ```
 ┌─────────────────────┐         ┌──────────────────────────┐
-│       GESTURE        │         │         SAMPLE            │
+│       GESTURE       │         │         SAMPLE           │
 ├─────────────────────┤  1───N  ├──────────────────────────┤
-│ PK  label  CHAR(1)  │────────▶│ PK  sample_id  INT        │
-│     target_count INT│         │ FK  label      CHAR(1)    │
-│     actual_count INT│         │     image_path VARCHAR    │
-└─────────────────────┘         │     timestamp  BIGINT     │
+│ PK  label  CHAR(1)  │────────▶│ PK  sample_id  INT       │
+│     target_count INT│         │ FK  label      CHAR(1)   │
+│     actual_count INT│         │     image_path VARCHAR   │
+└─────────────────────┘         │     timestamp  BIGINT    │
                                  └──────────────────────────┘
                                            │
                                            │ extracted by
