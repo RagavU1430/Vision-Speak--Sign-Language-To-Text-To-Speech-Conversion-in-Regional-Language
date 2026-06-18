@@ -37,7 +37,7 @@ class OneEuroFilter:
     that adapts to the velocity of the signal. Ideal for eliminating jitter at rest
     and lag during movement.
     """
-    def __init__(self, min_cutoff=0.5, beta=0.01, d_cutoff=1.0):
+    def __init__(self, min_cutoff=2.0, beta=0.1, d_cutoff=1.0):
         self.min_cutoff = float(min_cutoff)
         self.beta = float(beta)
         self.d_cutoff = float(d_cutoff)
@@ -75,7 +75,7 @@ class OneEuroFilter:
 
 # Class to smooth hand landmarks using One Euro Filter to eliminate jitter and lag
 class HandSmoother:
-    def __init__(self, min_cutoff=0.5, beta=0.01):
+    def __init__(self, min_cutoff=2.0, beta=0.1):
         self.min_cutoff = min_cutoff
         self.beta = beta
         # List of tracked hands: each entry is {"filter": OneEuroFilter, "last_wrist": (x, y, z)}
