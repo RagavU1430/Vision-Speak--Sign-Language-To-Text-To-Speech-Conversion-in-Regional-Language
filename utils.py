@@ -234,3 +234,32 @@ def extract_enhanced_features(hand_landmarks) -> np.ndarray:
     ])  # Total 99 features
 
     return features
+
+
+def extract_raw_normalized_landmarks(hand_landmarks) -> np.ndarray:
+    """
+    Extracts 63 raw normalized features from hand landmarks:
+      1. Translates all landmarks relative to the wrist (landmark 0).
+      2. Normalizes coordinates by dividing by wrist-to-middle-MCP (landmark 9) distance.
+    Returns:
+      A flat 1D numpy array of size 63.
+    """
+    # Handle both MediaPipe landmark objects and raw arrays/lists of coords
+    if hasattr(hand_landmarks, 'landmark'):
+        coords = np.array([[lm.x, lm.y, lm.z] for lm in hand_landmarks.landmark], dtype=np.float32)
+    else:
+        coords = np.array(hand_landmarks, dtype=np.float32).reshape(21, 3)
+
+    # 1. Translation: wrist is landmark 0
+    wrist = coords[0]
+    translated = coords - wrist  # shape: (21, 3)
+
+    # 2. Scale normalization
+    # Distance between wrist (0) and middle MCP (9)
+    hand_scale = np.linalg.norm(translated[9])
+    if hand_scale < 1e-6:
+        hand_scale = 1.0
+    normalized = translated / hand_scale
+
+    return normalized.flatten()
+

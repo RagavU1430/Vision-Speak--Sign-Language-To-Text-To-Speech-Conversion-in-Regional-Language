@@ -71,7 +71,7 @@ import pyttsx3
 import pythoncom
 from collections import deque, Counter
 from supabase_client import SupabaseManager
-from utils import extract_enhanced_features  # Enhanced landmarks and engineered features
+from utils import extract_enhanced_features, extract_raw_normalized_landmarks  # Enhanced landmarks and engineered features
 from emotion_detection import EmotionDetector
 
 # ── Optional: PIL for Unicode (Tamil) text rendering ────────────────────
@@ -87,6 +87,7 @@ except ImportError:
 MODEL_PATH = os.path.join("models", "mlp_model.pkl")
 ENCODER_PATH = os.path.join("models", "label_encoder.pkl")
 SCALER_PATH = os.path.join("models", "scaler.pkl")
+
 
 # Compatibility / Feature mode indicator
 MODEL_EXPECTS_ENHANCED = False
@@ -1043,6 +1044,10 @@ def load_model():
     return model, le, scaler
 
 
+
+
+
+
 def extract_landmarks(hand_landmarks) -> np.ndarray:
     """Convert MediaPipe hand landmarks to a flat 63-element array."""
     coords = []
@@ -1516,15 +1521,24 @@ def draw_hud(frame, prediction, confidence, probabilities, label_names,
                             cv2.FONT_HERSHEY_SIMPLEX, 0.45 * u_scale, GRAY, max(1, int(1 * u_scale)), cv2.LINE_AA)
         elif prediction:
             # Determine prediction display (show raw prediction even if low confidence, but draw in RED)
-            is_confident = (confidence >= CONFIDENCE_THRESHOLD)
             display_pred = prediction if prediction else ""
+            thresh = 0.95 if len(display_pred) > 1 else CONFIDENCE_THRESHOLD
+            is_confident = (confidence >= thresh)
             
-            # Prediction letter — large
+            # Prediction letter — large (dynamically scale font size to prevent overflow for phrases)
             pred_color = TEAL if is_confident else RED
-            letter_size = cv2.getTextSize(display_pred, cv2.FONT_HERSHEY_SIMPLEX, 3.0 * u_scale, max(1, int(4 * u_scale)))[0]
+            
+            font_scale = 3.0 * u_scale if len(display_pred) <= 1 else 0.8 * u_scale
+            max_text_w = panel_w - int(30 * u_scale)
+            while font_scale > 0.3:
+                letter_size = cv2.getTextSize(display_pred, cv2.FONT_HERSHEY_SIMPLEX, font_scale, max(1, int(font_scale * 1.5)))[0]
+                if letter_size[0] <= max_text_w:
+                    break
+                font_scale -= 0.05
+                
             letter_x = panel_x + (panel_w - letter_size[0]) // 2
             cv2.putText(frame, display_pred, (letter_x, panel_y + int(100 * u_scale)),
-                        cv2.FONT_HERSHEY_SIMPLEX, 3.0 * u_scale, pred_color, max(1, int(4 * u_scale)), cv2.LINE_AA)
+                        cv2.FONT_HERSHEY_SIMPLEX, font_scale, pred_color, max(1, int(font_scale * 1.5)), cv2.LINE_AA)
 
             # Confidence percentage
             conf_text = f"{confidence * 100:.1f}%"
@@ -1745,6 +1759,9 @@ def main():
     model, le, scaler = load_model()
     label_names = le.classes_
 
+
+
+
     # ── Initialize TTS engine (singleton) ───────────────────────────────────
     tts = SpeechEngine()
 
@@ -1810,6 +1827,9 @@ def main():
     last_added_letter = None             # The last letter successfully committed
     locked_until_reset = False           # True = waiting for hand removal or new sign
 
+
+
+
     # Feedback overlay
     feedback_message = None              # e.g. "Added A"
     feedback_timestamp = 0.0             # time.time() when feedback was set
@@ -1865,6 +1885,10 @@ def main():
         hand_detected = False
         now = time.time()
         finger_count = -1
+        
+        # Reset prediction display arrays to Alphabet model defaults
+        label_names = le.classes_
+        probabilities = np.zeros(len(label_names))
 
         # ── Expire feedback message after FEEDBACK_DISPLAY_DURATION ──────
         if feedback_message and (now - feedback_timestamp) > FEEDBACK_DISPLAY_DURATION:
@@ -1941,6 +1965,7 @@ def main():
             # Store current landmarks for next frame motion check
             prev_landmarks_pts = [[lm.x, lm.y] for lm in hand_lm.landmark]
 
+            # ── Alphabet Model Processing ──
             if not quality_ok:
                 hand_status = "Hand Not Ready"
                 hand_status_detail = quality_msg
@@ -1982,6 +2007,29 @@ def main():
                             elif finger_count != -1:
                                 # Failsafe: if count is determined but not 1 or 2, keep original but log check
                                 print(f"[GH CHECK]\nOriginal: {current_prediction}\nFingers: {finger_count}\nCorrected: {current_prediction}")
+
+                    # Post-processing verification and correction layer for A & I
+                    if current_prediction in ("A", "I"):
+                        try:
+                            if hasattr(hand_lm, 'landmark'):
+                                coords = np.array([[lm.x, lm.y, lm.z] for lm in hand_lm.landmark], dtype=np.float32)
+                            else:
+                                coords = np.array(hand_lm, dtype=np.float32).reshape(21, 3)
+                            wrist = coords[0]
+                            translated = coords - wrist
+                            hand_scale = np.linalg.norm(translated[9])
+                            if hand_scale < 1e-6:
+                                hand_scale = 1.0
+                            normalized = translated / hand_scale
+                            
+                            pinky_extended = np.linalg.norm(normalized[20]) > np.linalg.norm(normalized[18])
+                            corrected_prediction = "I" if pinky_extended else "A"
+                            
+                            if corrected_prediction != current_prediction:
+                                print(f"[AI CHECK]\nOriginal: {current_prediction}\nPinky Extended: {pinky_extended}\nCorrected: {corrected_prediction}")
+                                current_prediction = corrected_prediction
+                        except Exception as e:
+                            print(f"[AI CHECK] Error checking pinky: {e}")
 
                     # ── Step 3: Confidence Filtering ─────────────────────────────
                     filtered_pred = current_prediction if confidence >= CONFIDENCE_THRESHOLD else None

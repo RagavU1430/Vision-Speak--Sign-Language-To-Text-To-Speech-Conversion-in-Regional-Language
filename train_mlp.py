@@ -43,7 +43,8 @@ CM_PATH = os.path.join(MODEL_DIR, "confusion_matrix.png")
 
 VALID_EXTENSIONS = (".png", ".jpg", ".jpeg", ".bmp", ".webp")
 LABELS = list(string.ascii_uppercase)  # A-Z only
-LIMIT_SAMPLES_PER_GESTURE =1000 # Set to None for full training (3000/class). Set to a number (e.g. 200) for faster training.
+LIMIT_SAMPLES_PER_GESTURE = 500 # Set to None for full training (3000/class). Set to a number (e.g. 200) for faster training.
+BATCH_SIZE = 128  # Batch size for mini-batch training
 
 
 # ═════════════════════════════════════════════════════════════════════════════
@@ -227,6 +228,8 @@ def train_mlp(csv_path: str):
     mlp = MLPClassifier(
         hidden_layer_sizes=(512, 256, 128),
         activation="relu",
+        solver="adam",
+        batch_size=BATCH_SIZE,
         max_iter=300,
         early_stopping=True,
         validation_fraction=0.1,
