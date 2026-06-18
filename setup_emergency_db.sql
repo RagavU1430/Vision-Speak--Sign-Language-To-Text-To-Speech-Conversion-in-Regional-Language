@@ -7,6 +7,7 @@ CREATE TABLE IF NOT EXISTS public.emergency_events (
     translated_text TEXT,
     language TEXT NOT NULL,
     confidence DOUBLE PRECISION NOT NULL,
+    error_message TEXT,
     created_at TIMESTAMP WITH TIME ZONE DEFAULT timezone('utc'::text, now()) NOT NULL
 );
 

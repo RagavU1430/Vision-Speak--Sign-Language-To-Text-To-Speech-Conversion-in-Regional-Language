@@ -183,8 +183,8 @@ AVAILABLE_LANGUAGES = list(LANGUAGE_CONFIG.keys())
 
 # ── Emergency Configuration ──────────────────────────────────────────────────
 EMERGENCY_KEYWORDS = {
-    "English": ["HELP", "EMERGENCY", "DOCTOR", "AMBULANCE", "MEDICINE", "HOSPITAL", "PAIN", "ACCIDENT", "DANGER", "FIRE"],
-    "Tamil": ["உதவி", "அவசரம்", "மருத்துவர்", "ஆம்புலன்ஸ்", "மருத்துவமனை", "வலி", "விபத்து", "ஆபத்து", "தீ"]
+    "English": ["HELP ME", "HELP", "EMERGENCY", "AMBULANCE", "HOSPITAL", "DOCTOR"],
+    "Tamil": ["எனக்கு உதவி வேண்டும்", "உதவி", "அவசரம்", "ஆம்புலன்ஸ்", "மருத்துவமனை", "மருத்துவர்"]
 }
 
 def is_emergency_text(text: str) -> str | None:
@@ -195,10 +195,13 @@ def is_emergency_text(text: str) -> str | None:
     if not text:
         return None
     
-    # Check English keywords (tokenized comparison)
-    tokens = [t.upper().strip() for t in text.split()]
+    import re
+    upper_text = text.upper()
+    
+    # Check English keywords using word boundaries to avoid matching substrings of other words
     for kw in EMERGENCY_KEYWORDS["English"]:
-        if kw in tokens:
+        pattern = r"\b" + re.escape(kw) + r"\b"
+        if re.search(pattern, upper_text):
             return kw
 
     # Check Tamil keywords (direct substring match is safer because of word builders)
@@ -889,9 +892,10 @@ def trigger_sound_alert():
 
 def save_emergency_event(detected_keyword: str, recognized_text: str,
                          translated_text: str = "", language: str = "English",
-                         confidence: float = 100.0) -> bool:
+                         confidence: float = 100.0, error_message: str = None) -> bool:
     """
     Saves the emergency event details to the Supabase table `emergency_events`.
+    If error_message is provided, attempts to save it, falling back to a normal save if the column is missing.
     """
     try:
         from datetime import datetime, timezone
@@ -907,6 +911,18 @@ def save_emergency_event(detected_keyword: str, recognized_text: str,
             "confidence": confidence,
             "created_at": timestamp
         }
+        
+        if error_message:
+            try:
+                # Try inserting with error_message first
+                data_with_err = data.copy()
+                data_with_err["error_message"] = error_message
+                res = sb.insert("emergency_events", data_with_err)
+                if res is not None:
+                    print("[DB] Emergency Event and Error Saved Successfully")
+                    return True
+            except Exception as db_err:
+                print(f"[DB] Failed to insert with error_message column: {db_err}. Falling back to normal insert.")
         
         res = sb.insert("emergency_events", data)
         if res is not None:
@@ -983,9 +999,46 @@ def send_sms_alert(keyword: str, recognized_text: str, language: str):
     pass
 
 
-def send_whatsapp_alert(keyword: str, recognized_text: str, language: str):
-    """Optional future module: WhatsApp Business API integration."""
-    pass
+def send_whatsapp_alert(keyword: str, recognized_text: str, language: str, confidence: float = 100.0) -> bool:
+    """
+    Formats the emergency message, URL-encodes it, and opens WhatsApp Web.
+    Raises exceptions on failure for error handling.
+    """
+    try:
+        import webbrowser
+        import urllib.parse
+        from datetime import datetime, timezone
+        
+        # Format the emergency message exactly as specified
+        timestamp = datetime.now(timezone.utc).isoformat()
+        
+        message = (
+            f"🚨 VisionSpeak Emergency Alert\n\n"
+            f"Keyword: {keyword}\n\n"
+            f"Recognized Text: {recognized_text}\n\n"
+            f"Language: {language}\n\n"
+            f"Confidence: {confidence:.1f}%\n\n"
+            f"Time: {timestamp}\n\n"
+            f"Please check immediately."
+        )
+        
+        # URL-encode the message
+        encoded_message = urllib.parse.quote(message)
+        
+        # Contact: +919344347205 (use country code prefix in wa.me URL)
+        url = f"https://wa.me/919344347205?text={encoded_message}"
+        
+        print(f"[WHATSAPP] Opening URL: {url}")
+        
+        # Open default browser
+        success = webbrowser.open(url)
+        if not success:
+            raise RuntimeError("webbrowser.open failed to launch browser")
+            
+        return True
+    except Exception as e:
+        # Re-raise so Phase 7 can catch and log
+        raise e
 
 
 def send_email_alert(keyword: str, recognized_text: str, language: str):
@@ -1686,9 +1739,11 @@ def draw_hud(frame, prediction, confidence, probabilities, label_names,
         emergency_keyword = state.get("emergency_keyword", "UNKNOWN")
         emergency_time = state.get("emergency_trigger_time", time.time())
         emergency_language = state.get("emergency_language", "English")
+        wa_status = state.get("whatsapp_status", "Not Opened")
+        conf_val = state.get("emergency_confidence", 100.0)
         
-        alert_w = int(480 * u_scale)
-        alert_h = int(200 * u_scale)
+        alert_w = int(500 * u_scale)
+        alert_h = int(240 * u_scale)
         x1 = (w - alert_w) // 2
         y1 = (h - alert_h) // 2
         x2 = x1 + alert_w
@@ -1707,15 +1762,22 @@ def draw_hud(frame, prediction, confidence, probabilities, label_names,
                     cv2.FONT_HERSHEY_SIMPLEX, 0.75 * u_scale, WHITE, max(1, int(2 * u_scale)), cv2.LINE_AA)
         
         # Details
-        cv2.putText(frame, f"Detected Keyword: {emergency_keyword}", (x1 + int(30 * u_scale), y1 + int(95 * u_scale)),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.6 * u_scale, YELLOW, max(1, int(2 * u_scale)), cv2.LINE_AA)
+        cv2.putText(frame, f"Detected Keyword: {emergency_keyword}", (x1 + int(30 * u_scale), y1 + int(90 * u_scale)),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.55 * u_scale, YELLOW, max(1, int(2 * u_scale)), cv2.LINE_AA)
         
-        local_time_str = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(emergency_time))
-        cv2.putText(frame, f"Timestamp: {local_time_str}", (x1 + int(30 * u_scale), y1 + int(135 * u_scale)),
+        cv2.putText(frame, f"Confidence Score: {conf_val:.1f}%", (x1 + int(30 * u_scale), y1 + int(125 * u_scale)),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.52 * u_scale, WHITE, max(1, int(1 * u_scale)), cv2.LINE_AA)
         
-        cv2.putText(frame, f"Language: {emergency_language}", (x1 + int(30 * u_scale), y1 + int(170 * u_scale)),
+        # ISO 8601 Format of emergency_time
+        from datetime import datetime, timezone
+        iso_time_str = datetime.fromtimestamp(emergency_time, timezone.utc).isoformat()
+        cv2.putText(frame, f"Time: {iso_time_str[:23]}Z", (x1 + int(30 * u_scale), y1 + int(160 * u_scale)),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.52 * u_scale, WHITE, max(1, int(1 * u_scale)), cv2.LINE_AA)
+        
+        # WhatsApp status color
+        wa_color = GREEN if wa_status == "Success" else (RED if "Failed" in wa_status else YELLOW)
+        cv2.putText(frame, f"WhatsApp Alert: {wa_status}", (x1 + int(30 * u_scale), y1 + int(195 * u_scale)),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.52 * u_scale, wa_color, max(1, int(1.5 * u_scale)), cv2.LINE_AA)
 
 
 # ── Temporal Logic Engine ───────────────────────────────────────────────────
@@ -1835,8 +1897,10 @@ def main():
     emergency_trigger_time = 0.0
     emergency_language = "English"
     last_emergency_trigger_time = 0.0
-    emergency_cooldown_duration = 30.0  # 30 seconds duplicate protection
-    emergency_display_duration = 5.0    # Show alert popup for at least 5 seconds
+    emergency_cooldown_duration = 60.0  # 60 seconds duplicate protection (as per Success Criteria)
+    emergency_display_duration = 10.0   # Show alert popup for 10 seconds to read details
+    whatsapp_status = "Not Triggered"
+    emergency_confidence = 100.0
     
     # Query today's emergency count on boot (cached value incremented locally)
     print("[DB] Fetching today's emergency events count...")
@@ -2155,46 +2219,94 @@ def main():
         current_word_str = "".join(word_buffer).strip()
         current_sentence_str = " ".join(sentence_buffer).strip()
         
+        # Translate for emergency check if Tamil mode is active (Phase 1)
+        current_translated_str = ""
+        if selected_language == "Tamil":
+            if current_sentence_str:
+                current_translated_str = translate_to_tamil(current_sentence_str)
+            elif current_word_str:
+                current_translated_str = translate_to_tamil(current_word_str)
+        
+        # Check both recognized English and translated Tamil streams (Phase 1)
         detected_kw = is_emergency_text(current_word_str)
         if not detected_kw:
             detected_kw = is_emergency_text(current_sentence_str)
+        if not detected_kw and current_translated_str:
+            detected_kw = is_emergency_text(current_translated_str)
             
         if detected_kw:
             if now - last_emergency_trigger_time >= emergency_cooldown_duration:
+                # Calculate appropriate confidence score based on the stream that triggered (Phase 5)
+                if is_emergency_text(current_word_str):
+                    emergency_confidence = float(np.mean(word_confidences)) * 100.0 if word_confidences else confidence * 100.0
+                elif is_emergency_text(current_sentence_str):
+                    emergency_confidence = float(np.mean(sentence_confidences)) * 100.0 if sentence_confidences else confidence * 100.0
+                elif current_translated_str and is_emergency_text(current_translated_str):
+                    if current_sentence_str:
+                        emergency_confidence = float(np.mean(sentence_confidences)) * 100.0 if sentence_confidences else confidence * 100.0
+                    else:
+                        emergency_confidence = float(np.mean(word_confidences)) * 100.0 if word_confidences else confidence * 100.0
+                else:
+                    emergency_confidence = confidence * 100.0
+                
+                emergency_confidence = max(0.0, min(100.0, emergency_confidence))
+                
                 emergency_active = True
                 emergency_keyword = detected_kw
                 emergency_trigger_time = now
                 emergency_language = selected_language
                 last_emergency_trigger_time = now
+                whatsapp_status = "Opening..."
                 
-                print(f"[EMERGENCY] Active! Keyword: {detected_kw}")
+                print(f"[EMERGENCY] Active! Keyword: {detected_kw} | Confidence: {emergency_confidence:.1f}%")
                 
                 # 1. Sound Alert (non-blocking background thread)
                 trigger_sound_alert()
                 
-                # 2. Priority Speech (concat and speak at max volume)
+                # 2. Priority Speech / Bilingual Audio Feedback (Phase 6)
                 if selected_language == "Tamil":
-                    text_to_translate = current_sentence_str if current_sentence_str else current_word_str
-                    translated_tamil = translate_to_tamil(text_to_translate)
-                    priority_text = "அவசர உதவி கோரப்பட்டுள்ளது. " + translated_tamil
+                    priority_text = "அவசர நிலை கண்டறியப்பட்டது. வாட்ஸ்அப் எச்சரிக்கை தயாராக உள்ளது."
                     speech_lang = "Tamil"
-                    english_fallback = "Emergency assistance requested. " + text_to_translate
+                    english_fallback = "Emergency detected. WhatsApp alert prepared."
                 else:
-                    text_to_speak = current_sentence_str if current_sentence_str else current_word_str
-                    priority_text = "Emergency assistance requested. " + text_to_speak
+                    priority_text = "Emergency detected. WhatsApp alert prepared."
                     speech_lang = "English"
                     english_fallback = ""
                 
                 tts.speak(priority_text, language=speech_lang, volume=1.0, english_fallback=english_fallback)
                 
-                # 3. Supabase Log (non-blocking background thread)
-                db_translated = translate_to_tamil(current_sentence_str) if selected_language == "Tamil" else ""
-                db_thread = threading.Thread(
-                    target=save_emergency_event,
-                    args=(detected_kw, current_sentence_str, db_translated, selected_language, 100.0),
+                # 3. WhatsApp Web Alert & Supabase Logging (Phase 2, 3, 7)
+                # Run in a background thread to prevent UI freezing
+                def run_alert_pipeline(kw, recognized, translated, lang, conf):
+                    global whatsapp_status
+                    err_msg = None
+                    try:
+                        # Try to open WhatsApp Web (Phase 3)
+                        send_whatsapp_alert(kw, recognized, lang, conf)
+                        whatsapp_status = "Success"
+                    except Exception as wa_err:
+                        err_msg = str(wa_err)
+                        whatsapp_status = f"Failed - {err_msg[:25]}..." if len(err_msg) > 25 else f"Failed - {err_msg}"
+                        print(f"[ERROR] WhatsApp Web failed to open: {wa_err}")
+                    
+                    # Log the event (and any error) to Supabase (Phase 2 & 7)
+                    save_emergency_event(
+                        detected_keyword=kw,
+                        recognized_text=recognized,
+                        translated_text=translated,
+                        language=lang,
+                        confidence=conf,
+                        error_message=err_msg
+                    )
+                
+                db_translated = current_translated_str if current_translated_str else (translate_to_tamil(current_sentence_str) if selected_language == "Tamil" else "")
+                
+                alert_thread = threading.Thread(
+                    target=run_alert_pipeline,
+                    args=(detected_kw, current_sentence_str if current_sentence_str else current_word_str, db_translated, selected_language, emergency_confidence),
                     daemon=True
                 )
-                db_thread.start()
+                alert_thread.start()
                 
                 # Increment count
                 emergency_count_today += 1
@@ -2207,7 +2319,6 @@ def main():
                 
                 # 5. Future hooks
                 send_sms_alert(detected_kw, current_sentence_str, selected_language)
-                send_whatsapp_alert(detected_kw, current_sentence_str, selected_language)
                 send_email_alert(detected_kw, current_sentence_str, selected_language)
                 notify_caregiver(detected_kw, current_sentence_str, selected_language)
                 loc = share_location()
@@ -2240,6 +2351,8 @@ def main():
             "emergency_trigger_time": emergency_trigger_time,
             "emergency_language": emergency_language,
             "emergency_count_today": emergency_count_today,
+            "whatsapp_status": whatsapp_status,
+            "emergency_confidence": emergency_confidence,
             "hand_status": hand_status,
             "hand_status_detail": hand_status_detail,
             "tracking_status": tracking_status,
