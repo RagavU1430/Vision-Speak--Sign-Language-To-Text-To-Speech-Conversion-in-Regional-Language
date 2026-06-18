@@ -943,7 +943,7 @@ def get_emergency_history() -> list | None:
     """
     try:
         sb = SupabaseManager()
-        res = sb.client.table("emergency_events").select("*").order("created_at", descending=True).limit(5).execute()
+        res = sb.client.table("emergency_events").select("*").order("created_at", desc=True).limit(5).execute()
         return res.data
     except Exception as e:
         print(f"[DB] Error fetching emergency history: {e}")
@@ -1001,16 +1001,27 @@ def send_sms_alert(keyword: str, recognized_text: str, language: str):
 
 def send_whatsapp_alert(keyword: str, recognized_text: str, language: str, confidence: float = 100.0) -> bool:
     """
-    Formats the emergency message, URL-encodes it, and opens WhatsApp Web.
+    Formats the emergency message using Indian Standard Time (IST) and location coordinates,
+    URL-encodes it, and opens WhatsApp Web.
     Raises exceptions on failure for error handling.
     """
     try:
         import webbrowser
         import urllib.parse
-        from datetime import datetime, timezone
+        from datetime import datetime, timezone, timedelta
         
-        # Format the emergency message exactly as specified
-        timestamp = datetime.now(timezone.utc).isoformat()
+        # 1. Use real Indian Standard Time (IST = UTC + 5:30)
+        ist_tz = timezone(timedelta(hours=5, minutes=30))
+        indian_time = datetime.now(ist_tz)
+        indian_time_str = indian_time.strftime("%Y-%m-%d %H:%M:%S")
+        
+        # 2. Get Geolocation & Google Maps Map Link
+        loc = share_location()
+        city = loc.get("city", "Unknown City")
+        region = loc.get("region", "Unknown Region")
+        country = loc.get("country", "Unknown Country")
+        lat = loc.get("lat", 13.0827)
+        lon = loc.get("lon", 80.2707)
         
         message = (
             f"🚨 VisionSpeak Emergency Alert\n\n"
@@ -1018,14 +1029,16 @@ def send_whatsapp_alert(keyword: str, recognized_text: str, language: str, confi
             f"Recognized Text: {recognized_text}\n\n"
             f"Language: {language}\n\n"
             f"Confidence: {confidence:.1f}%\n\n"
-            f"Time: {timestamp}\n\n"
+            f"Time: {indian_time_str} (IST)\n\n"
+            f"Location: {city}, {region}, {country}\n"
+            f"Map: https://maps.google.com/?q={lat},{lon}\n\n"
             f"Please check immediately."
         )
         
         # URL-encode the message
         encoded_message = urllib.parse.quote(message)
         
-        # Contact: +919344347205 (use country code prefix in wa.me URL)
+        # Contact: +919344347205
         url = f"https://wa.me/919344347205?text={encoded_message}"
         
         print(f"[WHATSAPP] Opening URL: {url}")
@@ -1051,9 +1064,40 @@ def notify_caregiver(keyword: str, recognized_text: str, language: str):
     pass
 
 
-def share_location():
-    """Optional future module: Location Sharing (GPS / IP Geolocation)."""
-    return "Lat: 13.0827, Lon: 80.2707 (Chennai, India)"
+def share_location() -> dict:
+    """
+    Retrieves the device's approximate geolocation (latitude, longitude, city, region, country)
+    using a free IP-based geolocation service. Falls back to default values on failure.
+    """
+    try:
+        import urllib.request
+        import json
+        
+        url = "http://ip-api.com/json/"
+        req = urllib.request.Request(url, headers={'User-Agent': 'Mozilla/5.0'})
+        with urllib.request.urlopen(req, timeout=3) as response:
+            data = json.loads(response.read().decode())
+            if data.get("status") == "success":
+                return {
+                    "lat": data.get("lat"),
+                    "lon": data.get("lon"),
+                    "city": data.get("city"),
+                    "region": data.get("regionName"),
+                    "country": data.get("country"),
+                    "success": True
+                }
+    except Exception as e:
+        print(f"[LOCATION] Error fetching geolocation: {e}")
+        
+    # Default fallback: Chennai, India coordinates
+    return {
+        "lat": 13.0827,
+        "lon": 80.2707,
+        "city": "Chennai",
+        "region": "Tamil Nadu",
+        "country": "India",
+        "success": False
+    }
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -2322,7 +2366,7 @@ def main():
                 send_email_alert(detected_kw, current_sentence_str, selected_language)
                 notify_caregiver(detected_kw, current_sentence_str, selected_language)
                 loc = share_location()
-                print(f"[FUTURE READY] Share location: {loc}")
+                print(f"[FUTURE READY] Share location: Lat: {loc.get('lat')}, Lon: {loc.get('lon')} ({loc.get('city')}, {loc.get('country')})")
 
         # ── Get Emotion Result ──────────────────────────────────────────
         emotion_str = "Neutral"
