@@ -2278,7 +2278,7 @@ def main():
                 # 3. WhatsApp Web Alert & Supabase Logging (Phase 2, 3, 7)
                 # Run in a background thread to prevent UI freezing
                 def run_alert_pipeline(kw, recognized, translated, lang, conf):
-                    global whatsapp_status
+                    nonlocal whatsapp_status
                     err_msg = None
                     try:
                         # Try to open WhatsApp Web (Phase 3)
