@@ -2056,6 +2056,30 @@ def main():
                         except Exception as e:
                             print(f"[DI CHECK] Error checking fingers: {e}")
 
+                    # Post-processing verification and correction layer for K & V
+                    if current_prediction in ("K", "V"):
+                        try:
+                            if hasattr(hand_lm, 'landmark'):
+                                coords = np.array([[lm.x, lm.y, lm.z] for lm in hand_lm.landmark], dtype=np.float32)
+                            else:
+                                coords = np.array(hand_lm, dtype=np.float32).reshape(21, 3)
+                            wrist = coords[0]
+                            translated = coords - wrist
+                            hand_scale = np.linalg.norm(translated[9])
+                            if hand_scale < 1e-6:
+                                hand_scale = 1.0
+                            normalized = translated / hand_scale
+                            
+                            # Distance between thumb tip (4) and middle PIP (10)
+                            d_4_10 = np.linalg.norm(normalized[4] - normalized[10])
+                            corrected_prediction = "K" if d_4_10 < 0.48 else "V"
+                            
+                            if corrected_prediction != current_prediction:
+                                print(f"[KV CHECK]\nOriginal: {current_prediction}\nDistance 4-10: {d_4_10:.4f}\nCorrected: {corrected_prediction}")
+                                current_prediction = corrected_prediction
+                        except Exception as e:
+                            print(f"[KV CHECK] Error checking fingers: {e}")
+
                     # ── Step 3: Confidence Filtering ─────────────────────────────
                     filtered_pred = current_prediction if confidence >= CONFIDENCE_THRESHOLD else None
                     prediction_history.append(filtered_pred)
