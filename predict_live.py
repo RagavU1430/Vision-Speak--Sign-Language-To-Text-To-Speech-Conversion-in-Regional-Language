@@ -222,7 +222,7 @@ TRANSLATION_DICT = {
         "I LOVE YOU": "நான் உன்னை காதலிக்கிறேன்",
         "GOOD MORNING": "காலை வணக்கம்",
         "GOOD NIGHT": "இரவு வணக்கம்",
-        "WELCOME": "வரவேற்கிறோம்",
+        "WELCOME": "வரவேற்கிறேன்",
         "HOW ARE YOU": "நீங்கள் எப்படி இருக்கிறீர்கள்",
         "FINE": "நலம்",
         "MY NAME IS": "என் பெயர்",
@@ -262,7 +262,9 @@ TRANSLATION_DICT = {
         "SMALL": "சிறிய",
         "HOT": "சூடான",
         "COLD": "குளிர்",
-        "HI": "வணக்கம்"
+        "HI": "வணக்கம்",
+        "GOOD": "நல்லது",
+        "HELP ME": "எனக்கு உதவி வேண்டும்"
     }
 }
 
@@ -280,7 +282,7 @@ TAMIL_PHONETIC_DICT = {
     "நான் உன்னை காதலிக்கிறேன்": "naan unnai kaadhalikkiren",
     "காலை வணக்கம்": "kaalai vanakkam",
     "இரவு வணக்கம்": "iravu vanakkam",
-    "வரவேற்கிறோம்": "varaverkirom",
+    "வரவேற்கிறேன்": "varaverkiren",
     "நீங்கள் எப்படி இருக்கிறீர்கள்": "neenga eppadi irukeenga",
     "நலம்": "nalam",
     "என் பெயர்": "en peyar",
@@ -321,6 +323,8 @@ TAMIL_PHONETIC_DICT = {
     "சூடான": "soodana",
     "குளிர்": "kulir",
     "அவசர உதவி கோரப்பட்டுள்ளது": "avasara udhavi khorappattulladhu",
+    "நல்லது": "nalladhu",
+    "எனக்கு உதவி வேண்டும்": "enakku udhavi vendum",
 }
 
 def transliterate_tamil_text(text: str) -> str:
@@ -362,16 +366,13 @@ def transliterate_tamil_text(text: str) -> str:
 
 
 # ── Global Translator & Cache for Real-Time Translation ──────────────────────
-_google_translator = None
 _translation_cache = {}
 
 def translate_to_tamil(text: str) -> str:
     """
-    Translates English text to Tamil using googletrans==4.0.0rc1.
-    Utilizes local dictionary mapping first, then memory cache, and finally 
-    falls back to the googletrans API to prevent UI freezing and API limit issues.
+    Translates English text to Tamil using GoogleTranslator from deep_translator
+    as a fallback when local dictionary lookups fail. Supports caching and handles errors gracefully.
     """
-    global _google_translator
     if not text or not text.strip():
         return text
 
@@ -381,7 +382,7 @@ def translate_to_tamil(text: str) -> str:
     def log_translation(source, match_type, api_status, output):
         log_str = f"[TRANSLATE]\nSource: {source}\nDictionary Match: {match_type}\n"
         if api_status:
-            log_str += f"{api_status}\n"
+            log_str += f"API Call Status: {api_status}\n"
         log_str += f"Output: {output}"
         try:
             print(log_str)
@@ -402,32 +403,26 @@ def translate_to_tamil(text: str) -> str:
     # 2. Check memory cache for previous translations
     if cleaned_text in _translation_cache:
         cached_val = _translation_cache[cleaned_text]
-        if cached_val != cleaned_text:
-            log_translation(cleaned_text, "No", "Google Translate Used", cached_val)
-        else:
-            log_translation(cleaned_text, "No", "Google Translate Used (Failed)", cleaned_text)
+        log_translation(cleaned_text, "No", "Cached", cached_val)
         return cached_val
 
-    # 3. Call googletrans API
+    # 3. Call deep-translator API
     try:
-        if _google_translator is None:
-            from googletrans import Translator
-            _google_translator = Translator()
-        
-        result = _google_translator.translate(cleaned_text, src='en', dest='ta')
-        if result and result.text:
-            _translation_cache[cleaned_text] = result.text
-            log_translation(cleaned_text, "No", "Google Translate Used", result.text)
-            return result.text
+        from deep_translator import GoogleTranslator
+        translated_text = GoogleTranslator(source='en', target='ta').translate(cleaned_text)
+        if translated_text:
+            _translation_cache[cleaned_text] = translated_text
+            log_translation(cleaned_text, "No", "GoogleTranslator API (Success)", translated_text)
+            return translated_text
         else:
-            print("[ERROR] Tamil Translation Failed")
+            log_translation(cleaned_text, "No", "GoogleTranslator API (Failed - Empty)", cleaned_text)
+            _translation_cache[cleaned_text] = cleaned_text
+            return cleaned_text
     except Exception as e:
         print(f"[ERROR] Tamil Translation Failed: {e}")
-
-    # Cache original text on failure to prevent spamming the API on every frame
-    _translation_cache[cleaned_text] = cleaned_text
-    log_translation(cleaned_text, "No", "Google Translate Used (Failed)", cleaned_text)
-    return cleaned_text
+        _translation_cache[cleaned_text] = cleaned_text
+        log_translation(cleaned_text, "No", f"GoogleTranslator API (Failed - Error: {e})", cleaned_text)
+        return cleaned_text
 
 
 
@@ -2030,6 +2025,36 @@ def main():
                                 current_prediction = corrected_prediction
                         except Exception as e:
                             print(f"[AI CHECK] Error checking pinky: {e}")
+
+                    # Post-processing verification and correction layer for D & I
+                    if current_prediction in ("D", "I"):
+                        try:
+                            if hasattr(hand_lm, 'landmark'):
+                                coords = np.array([[lm.x, lm.y, lm.z] for lm in hand_lm.landmark], dtype=np.float32)
+                            else:
+                                coords = np.array(hand_lm, dtype=np.float32).reshape(21, 3)
+                            wrist = coords[0]
+                            translated = coords - wrist
+                            hand_scale = np.linalg.norm(translated[9])
+                            if hand_scale < 1e-6:
+                                hand_scale = 1.0
+                            normalized = translated / hand_scale
+                            
+                            index_extended = np.linalg.norm(normalized[8]) > np.linalg.norm(normalized[6])
+                            pinky_extended = np.linalg.norm(normalized[20]) > np.linalg.norm(normalized[18])
+                            
+                            if index_extended and not pinky_extended:
+                                corrected_prediction = "D"
+                            elif pinky_extended and not index_extended:
+                                corrected_prediction = "I"
+                            else:
+                                corrected_prediction = current_prediction
+                            
+                            if corrected_prediction != current_prediction:
+                                print(f"[DI CHECK]\nOriginal: {current_prediction}\nIndex Extended: {index_extended}\nPinky Extended: {pinky_extended}\nCorrected: {corrected_prediction}")
+                                current_prediction = corrected_prediction
+                        except Exception as e:
+                            print(f"[DI CHECK] Error checking fingers: {e}")
 
                     # ── Step 3: Confidence Filtering ─────────────────────────────
                     filtered_pred = current_prediction if confidence >= CONFIDENCE_THRESHOLD else None
