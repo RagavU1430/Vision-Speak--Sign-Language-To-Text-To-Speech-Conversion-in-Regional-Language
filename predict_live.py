@@ -65,6 +65,7 @@ if not hasattr(httpcore, "SyncHTTPTransport"):
 
 # ── Imports ─────────────────────────────────────────────────────────────────
 import functools
+import json
 import sys
 import threading
 import time
@@ -77,8 +78,8 @@ import numpy as np
 import pythoncom
 import pyttsx3
 
-from emotion_detection import EmotionDetector
-from supabase_client import SupabaseManager
+from emotion.emotion_detection import EmotionDetector
+from database.supabase_client import SupabaseManager
 from utils import (  # Enhanced landmarks and engineered features
     extract_enhanced_features,
     extract_raw_normalized_landmarks,
@@ -209,6 +210,7 @@ def get_user_details():
 MODEL_PATH = os.path.join("models", "mlp_model.pkl")
 ENCODER_PATH = os.path.join("models", "label_encoder.pkl")
 SCALER_PATH = os.path.join("models", "scaler.pkl")
+PROFILE_PATH = "profile.json"
 
 
 # Compatibility / Feature mode indicator
@@ -290,28 +292,32 @@ AUTO_CLEAR = True  # Clear sentence buffer automatically after speaking
 
 class CollisionRuleEngine:
     """
-    Rule-based verification layer for highly confused letter pairs.
-    After the MLP prediction, these geometric rules verify or correct the output.
+    Rule-based verification layer for ALL known confused letter pairs.
+    After the MLP prediction, these geometric rules verify or correct the output
+    based on finger counts, distances, and angles extracted from landmarks.
     """
     def __init__(self):
         self.rules = self._build_rules()
 
     def _build_rules(self):
         return {
-            ("G", "H"): self._rule_finger_count_gh,
-            ("H", "G"): self._rule_finger_count_gh,
-            ("M", "N"): self._rule_mn,
-            ("N", "M"): self._rule_mn,
-            ("U", "V"): self._rule_uv,
-            ("V", "U"): self._rule_uv,
-            ("C", "O"): self._rule_co,
-            ("O", "C"): self._rule_co,
-            ("S", "T"): self._rule_st,
-            ("T", "S"): self._rule_st,
-            ("W", "E"): self._rule_we,
-            ("E", "W"): self._rule_we,
-            ("D", "F"): self._rule_df,
-            ("F", "D"): self._rule_df,
+            ("G", "H"): self._rule_count_gh,   ("H", "G"): self._rule_count_gh,
+            ("M", "N"): self._rule_mn,          ("N", "M"): self._rule_mn,
+            ("U", "V"): self._rule_uv,          ("V", "U"): self._rule_uv,
+            ("C", "O"): self._rule_co,          ("O", "C"): self._rule_co,
+            ("S", "T"): self._rule_st,          ("T", "S"): self._rule_st,
+            ("W", "E"): self._rule_we,          ("E", "W"): self._rule_we,
+            ("D", "F"): self._rule_df,          ("F", "D"): self._rule_df,
+            ("A", "J"): self._rule_count_aj,    ("J", "A"): self._rule_count_aj,
+            ("A", "W"): self._rule_count_aw,    ("W", "A"): self._rule_count_aw,
+            ("A", "G"): self._rule_count_ag,    ("G", "A"): self._rule_count_ag,
+            ("G", "R"): self._rule_gr,          ("R", "G"): self._rule_gr,
+            ("H", "J"): self._rule_count_hj,    ("J", "H"): self._rule_count_hj,
+            ("I", "P"): self._rule_ip,          ("P", "I"): self._rule_ip,
+            ("I", "Q"): self._rule_iq,          ("Q", "I"): self._rule_iq,
+            ("M", "Y"): self._rule_my,          ("Y", "M"): self._rule_my,
+            ("P", "Q"): self._rule_pq,          ("Q", "P"): self._rule_pq,
+            ("S", "Z"): self._rule_sz,          ("Z", "S"): self._rule_sz,
         }
 
     def _extract(self, landmarks_21x3):
@@ -323,25 +329,144 @@ class CollisionRuleEngine:
             scale = 1.0
         return translated / scale
 
-    def count_fingers(self, landmarks_21x3):
+    def _finger_states(self, landmarks_21x3):
         n = self._extract(landmarks_21x3)
-        thumb = np.linalg.norm(n[4] - n[5]) > 0.8
-        index = np.linalg.norm(n[8]) > np.linalg.norm(n[6])
-        middle = np.linalg.norm(n[12]) > np.linalg.norm(n[10])
-        ring = np.linalg.norm(n[16]) > np.linalg.norm(n[14])
-        pinky = np.linalg.norm(n[20]) > np.linalg.norm(n[18])
-        return sum([thumb, index, middle, ring, pinky])
+        return {
+            "thumb": np.linalg.norm(n[4] - n[5]) > 0.8,
+            "index": np.linalg.norm(n[8]) > np.linalg.norm(n[6]),
+            "middle": np.linalg.norm(n[12]) > np.linalg.norm(n[10]),
+            "ring": np.linalg.norm(n[16]) > np.linalg.norm(n[14]),
+            "pinky": np.linalg.norm(n[20]) > np.linalg.norm(n[18]),
+        }
 
-    def _rule_finger_count_gh(self, landmarks, _):
-        fc = self.count_fingers(landmarks)
+    def count_fingers(self, landmarks_21x3):
+        s = self._finger_states(landmarks_21x3)
+        return sum(s.values())
+
+    def _which_finger(self, landmarks_21x3):
+        s = self._finger_states(landmarks_21x3)
+        return [k for k, v in s.items() if v]
+
+    def _tip_dist(self, landmarks_21x3, a, b):
+        n = self._extract(landmarks_21x3)
+        return np.linalg.norm(n[a] - n[b])
+
+    # ── Fist-based rules (A = 0 fingers, others have 1+) ──────────────
+
+    def _rule_count_aj(self, lm, _):
+        fc = self.count_fingers(lm)
+        if fc <= 1:
+            return "A", 0.90
+        elif fc >= 2:
+            return "J", 0.85
+        return None, 0.0
+
+    def _rule_count_aw(self, lm, _):
+        fc = self.count_fingers(lm)
+        if fc <= 1:
+            return "A", 0.90
+        elif fc >= 3:
+            return "W", 0.85
+        return None, 0.0
+
+    def _rule_count_ag(self, lm, _):
+        fc = self.count_fingers(lm)
+        if fc <= 1:
+            return "A", 0.85
+        elif fc == 2:
+            return "G", 0.85
+        return None, 0.0
+
+    # ── G (1 finger) vs R (2 crossed fingers) ─────────────────────────
+
+    def _rule_gr(self, lm, _):
+        fc = self.count_fingers(lm)
+        if fc == 1:
+            return "G", 0.85
+        elif fc >= 2:
+            return "R", 0.85
+        return None, 0.0
+
+    # ── H (2 fingers) vs J (1 hook finger, pinky used) ────────────────
+
+    def _rule_count_hj(self, lm, _):
+        fc = self.count_fingers(lm)
+        if fc <= 1:
+            return "J", 0.85
+        elif fc >= 2:
+            return "H", 0.85
+        return None, 0.0
+
+    # ── I (pinky up) vs P (index+thumb circle) ────────────────────────
+
+    def _rule_ip(self, lm, _):
+        n = self._extract(lm)
+        pinky_up = np.linalg.norm(n[20]) > np.linalg.norm(n[18])
+        thumb_idx = self._tip_dist(lm, 4, 8)
+        if pinky_up and thumb_idx > 0.3:
+            return "I", 0.85
+        if thumb_idx < 0.25:
+            return "P", 0.85
+        return None, 0.0
+
+    # ── I (pinky up) vs Q (pinky+thumb) ───────────────────────────────
+
+    def _rule_iq(self, lm, _):
+        n = self._extract(lm)
+        pinky_up = np.linalg.norm(n[20]) > np.linalg.norm(n[18])
+        thumb_pinky = self._tip_dist(lm, 4, 20)
+        if pinky_up and thumb_pinky > 0.4:
+            return "I", 0.85
+        if thumb_pinky < 0.3:
+            return "Q", 0.85
+        return None, 0.0
+
+    # ── M (3 fingers IMR) vs Y (thumb+pinky) ──────────────────────────
+
+    def _rule_my(self, lm, _):
+        fc = self.count_fingers(lm)
+        s = self._finger_states(lm)
+        if fc >= 3 and s.get("index") and s.get("middle") and s.get("ring"):
+            return "M", 0.85
+        if fc <= 2 and s.get("thumb") and s.get("pinky") and not s.get("index"):
+            return "Y", 0.85
+        return None, 0.0
+
+    # ── P (index+thumb circle) vs Q (pinky+thumb touch) ───────────────
+
+    def _rule_pq(self, lm, _):
+        n = self._extract(lm)
+        idx_tip = n[8]; pin_tip = n[20]; thumb_tip = n[4]
+        thumb_idx = np.linalg.norm(thumb_tip - idx_tip)
+        thumb_pin = np.linalg.norm(thumb_tip - pin_tip)
+        if thumb_idx < thumb_pin:
+            return "P", 0.80
+        else:
+            return "Q", 0.80
+
+    # ── S (fist) vs Z (index point + moving) ──────────────────────────
+
+    def _rule_sz(self, lm, _):
+        fc = self.count_fingers(lm)
+        s = self._finger_states(lm)
+        if fc == 0:
+            return "S", 0.90
+        if fc == 1 and s.get("index"):
+            return "Z", 0.85
+        return None, 0.0
+
+    # ── Original existing rules (kept and referenced) ──────────────────
+
+    def _rule_count_gh(self, lm, _):
+        fc = self.count_fingers(lm)
         if fc <= 1:
             return "G", 0.95
         elif fc >= 2:
             return "H", 0.90
         return None, 0.0
 
-    def _rule_mn(self, landmarks, _):
-        n = self._extract(landmarks)
+    def _rule_mn(self, lm, _):
+        n = self._extract(lm)
         index = np.linalg.norm(n[8]) > np.linalg.norm(n[6])
         middle = np.linalg.norm(n[12]) > np.linalg.norm(n[10])
         ring = np.linalg.norm(n[16]) > np.linalg.norm(n[14])
@@ -350,13 +475,13 @@ class CollisionRuleEngine:
             return "M", 0.85
         elif extended <= 2:
             return "N", 0.85
-        thumb_idx_dist = np.linalg.norm(n[4] - n[5])
-        if thumb_idx_dist < 0.6:
+        thumb_idx = np.linalg.norm(n[4] - n[5])
+        if thumb_idx < 0.6:
             return "M", 0.70
         return None, 0.0
 
-    def _rule_uv(self, landmarks, _):
-        n = self._extract(landmarks)
+    def _rule_uv(self, lm, _):
+        n = self._extract(lm)
         idx_mid_dist = np.linalg.norm(n[8] - n[12])
         if idx_mid_dist < 0.3:
             return "U", 0.90
@@ -364,42 +489,41 @@ class CollisionRuleEngine:
             return "V", 0.90
         return None, 0.0
 
-    def _rule_co(self, landmarks, _):
-        n = self._extract(landmarks)
-        thumb_tip = n[4]; index_tip = n[8]
-        dist = np.linalg.norm(thumb_tip - index_tip)
+    def _rule_co(self, lm, _):
+        n = self._extract(lm)
+        dist = np.linalg.norm(n[4] - n[8])
         if dist < 0.2:
             return "O", 0.85
         elif dist >= 0.3:
             return "C", 0.85
         return None, 0.0
 
-    def _rule_st(self, landmarks, _):
-        fc = self.count_fingers(landmarks)
+    def _rule_st(self, lm, _):
+        fc = self.count_fingers(lm)
         if fc == 0:
             return "S", 0.90
-        n = self._extract(landmarks)
+        n = self._extract(lm)
         thumb_ext = np.linalg.norm(n[4] - n[5]) > 0.8
         if thumb_ext:
             return "T", 0.80
         return None, 0.0
 
-    def _rule_we(self, landmarks, _):
-        fc = self.count_fingers(landmarks)
+    def _rule_we(self, lm, _):
+        fc = self.count_fingers(lm)
         if fc >= 3:
             return "W", 0.85
         elif fc <= 1:
             return "E", 0.80
         return None, 0.0
 
-    def _rule_df(self, landmarks, _):
-        n = self._extract(landmarks)
+    def _rule_df(self, lm, _):
+        n = self._extract(lm)
         index_up = np.linalg.norm(n[8]) > np.linalg.norm(n[6])
-        thumb_idx_dist = np.linalg.norm(n[4] - n[5])
-        fc = self.count_fingers(landmarks)
+        thumb_idx = np.linalg.norm(n[4] - n[5])
+        fc = self.count_fingers(lm)
         if index_up and fc == 1:
             return "D", 0.90
-        if thumb_idx_dist < 0.2 and index_up:
+        if thumb_idx < 0.2 and index_up:
             return "F", 0.85
         return None, 0.0
 
@@ -2094,7 +2218,7 @@ def draw_hud(
     debug_x = margin
     debug_y = margin + title_h + int(12 * u_scale)
     debug_w = int(240 * u_scale)
-    debug_h = int(220 * u_scale)
+    debug_h = int(260 * u_scale)
     draw_rounded_rect(
         frame,
         (debug_x, debug_y),
@@ -2235,31 +2359,38 @@ def draw_hud(
 
     # ── PHASE 10: Collision Debug Panel ─────────────────────────────────────
     col_debug = state.get("collision_debug", {})
+    top_pred = col_debug.get("prediction", state.get("prediction", ""))
+    top_conf = col_debug.get("confidence", 0.0)
     second_best = col_debug.get("second_best", "")
     second_conf = col_debug.get("second_conf", 0.0)
     collision_risk = col_debug.get("collision_risk", 1.0)
     auto_corrected = col_debug.get("auto_corrected", False)
     rule_used = col_debug.get("rule_used", "")
 
-    risk_str = f"Alt: {second_best} ({second_conf * 100:.0f}%)"
     risk_color = ORANGE if collision_risk < 0.15 else (YELLOW if collision_risk < 0.3 else GREEN)
 
     cv2.putText(
-        frame, risk_str,
+        frame, f"Top-1: {top_pred} ({top_conf * 100:.0f}%)",
         (debug_x + int(15 * u_scale), y_off + int(168 * u_scale)),
+        cv2.FONT_HERSHEY_SIMPLEX, 0.42 * u_scale, TEAL,
+        max(1, int(1 * u_scale)), cv2.LINE_AA,
+    )
+    cv2.putText(
+        frame, f"Top-2: {second_best} ({second_conf * 100:.0f}%)",
+        (debug_x + int(15 * u_scale), y_off + int(188 * u_scale)),
         cv2.FONT_HERSHEY_SIMPLEX, 0.42 * u_scale, risk_color,
         max(1, int(1 * u_scale)), cv2.LINE_AA,
     )
     cv2.putText(
-        frame, f"Risk: {collision_risk:.3f}",
-        (debug_x + int(15 * u_scale), y_off + int(188 * u_scale)),
+        frame, f"Gap: {collision_risk:.3f}",
+        (debug_x + int(15 * u_scale), y_off + int(208 * u_scale)),
         cv2.FONT_HERSHEY_SIMPLEX, 0.42 * u_scale, risk_color,
         max(1, int(1 * u_scale)), cv2.LINE_AA,
     )
     if auto_corrected:
         cv2.putText(
             frame, f"CORRECTED ({rule_used})",
-            (debug_x + int(15 * u_scale), y_off + int(208 * u_scale)),
+            (debug_x + int(15 * u_scale), y_off + int(228 * u_scale)),
             cv2.FONT_HERSHEY_SIMPLEX, 0.42 * u_scale, ORANGE,
             max(1, int(2 * u_scale)), cv2.LINE_AA,
         )
@@ -2390,8 +2521,19 @@ def draw_hud(
                 conf_color,
             )
 
+            # ── Second-best prediction (top-2 alternative) ─────────────────────
+            if second_best and second_conf > 0:
+                alt_text = f"Alt: {second_best} ({second_conf * 100:.0f}%)"
+                alt_color = ORANGE if collision_risk < 0.15 else GRAY
+                cv2.putText(
+                    frame, alt_text,
+                    (panel_x + int(20 * u_scale), panel_y + int(185 * u_scale)),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.5 * u_scale, alt_color,
+                    max(1, int(1 * u_scale)), cv2.LINE_AA,
+                )
+
             # ── Hold-time progress (temporal feedback) ──────────────────────────
-            y_hold = panel_y + int(195 * u_scale)
+            y_hold = panel_y + int(220 * u_scale)
             if prediction in ("G", "H") and state.get("finger_count", -1) != -1:
                 f_count = state["finger_count"]
                 cv2.putText(
@@ -2865,16 +3007,36 @@ def get_majority_prediction(history, consistency_threshold):
 def main():
     global current_user
 
-    # ── Startup User Information Form (replaces login/authentication) ─────────
-    print("\n" + "=" * 58)
-    print("  VisionSpeak - Sign Language Communication System")
-    print("  Please fill in your details to continue.")
-    print("=" * 58)
-    user_data = get_user_details()
-    if user_data is None:
-        print("\n[EXIT] Form closed. Exiting.")
-        sys.exit(0)
-    current_user = user_data
+    # ── User profile: load from profile.json or show setup form ───────────────
+    if os.path.exists(PROFILE_PATH):
+        try:
+            with open(PROFILE_PATH, "r", encoding="utf-8") as f:
+                current_user = json.load(f)
+            print(f"[PROFILE] Loaded profile for {current_user.get('name', 'User')}")
+        except (json.JSONDecodeError, IOError) as e:
+            print(f"[PROFILE] Corrupted profile ({e}), showing setup form.")
+            current_user = {}
+    else:
+        current_user = {}
+
+    if not current_user.get("name"):
+        print("\n" + "=" * 58)
+        print("  VisionSpeak - Sign Language Communication System")
+        print("  Please fill in your details to continue.")
+        print("=" * 58)
+        user_data = get_user_details()
+        if user_data is None:
+            print("\n[EXIT] Form closed. Exiting.")
+            sys.exit(0)
+        current_user = user_data
+        # Persist profile for next launch
+        try:
+            with open(PROFILE_PATH, "w", encoding="utf-8") as f:
+                json.dump(current_user, f, indent=2, ensure_ascii=False)
+            print(f"[PROFILE] Saved profile to {PROFILE_PATH}")
+        except IOError as e:
+            print(f"[PROFILE] Warning: could not save profile ({e})")
+
     print(f"[OK] Welcome, {current_user['name']}! Starting VisionSpeak...")
 
     print("\n" + "=" * 58)
