@@ -999,10 +999,10 @@ def send_sms_alert(keyword: str, recognized_text: str, language: str):
     pass
 
 
-def send_whatsapp_alert(keyword: str, recognized_text: str, language: str, confidence: float = 100.0) -> bool:
+def send_whatsapp_alert(keyword: str, recognized_text: str, language: str, confidence: float = 100.0, profile: dict = None) -> bool:
     """
     Formats the emergency message using Indian Standard Time (IST) and location coordinates,
-    URL-encodes it, and opens WhatsApp Web.
+    URL-encodes it, and opens WhatsApp Web targeting the user's emergency contact.
     Raises exceptions on failure for error handling.
     """
     try:
@@ -1023,23 +1023,39 @@ def send_whatsapp_alert(keyword: str, recognized_text: str, language: str, confi
         lat = loc.get("lat", 13.0827)
         lon = loc.get("lon", 80.2707)
         
+        # 3. Retrieve User Profile Details from profile dict or env defaults
+        if profile:
+            user_name = profile.get("name", "Unknown User")
+            user_age = str(profile.get("age", "Unknown"))
+            emergency_contact = profile.get("emergency_contact", "919344347205")
+        else:
+            user_name = os.getenv("EMERGENCY_USER_NAME", "Ragav U")
+            user_age = os.getenv("EMERGENCY_USER_AGE", "21")
+            emergency_contact = "919344347205"
+        
+        # Format location details
+        location_detail = f"{city}, {region}, {country} (Google Maps: https://maps.google.com/?q={lat},{lon})"
+        
+        # Format message according to the exact requested template
         message = (
-            f"🚨 VisionSpeak Emergency Alert\n\n"
-            f"Keyword: {keyword}\n\n"
-            f"Recognized Text: {recognized_text}\n\n"
-            f"Language: {language}\n\n"
-            f"Confidence: {confidence:.1f}%\n\n"
-            f"Time: {indian_time_str} (IST)\n\n"
-            f"Location: {city}, {region}, {country}\n"
-            f"Map: https://maps.google.com/?q={lat},{lon}\n\n"
-            f"Please check immediately."
+            f"VisionSpeak Emergency Alert\n\n"
+            f"Name: {user_name}\n\n"
+            f"Age: {user_age}\n\n"
+            f"Location: {location_detail}\n\n"
+            f"Assistance Required: {keyword}\n\n"
+            f"Date and Time: {indian_time_str} (IST)\n\n"
+            f"The user has requested assistance through the VisionSpeak Sign Language Communication System. Kindly provide the required support at the earliest."
         )
         
         # URL-encode the message
         encoded_message = urllib.parse.quote(message)
         
-        # Contact: +919344347205
-        url = f"https://wa.me/919344347205?text={encoded_message}"
+        # Clean up the emergency contact number (keep only digits)
+        clean_contact = "".join(c for c in emergency_contact if c.isdigit())
+        if len(clean_contact) == 10:
+            clean_contact = "91" + clean_contact
+            
+        url = f"https://wa.me/{clean_contact}?text={encoded_message}"
         
         print(f"[WHATSAPP] Opening URL: {url}")
         
@@ -1870,8 +1886,24 @@ def main():
     supabase = SupabaseManager()
     supabase.connect()
 
+    # ── Authentication Flow (Auto-Login or Login/Register GUI) ──────────────
+    import auth_gui
+    auth_result = auth_gui.run_auth_flow()
+    if not auth_result:
+        print("[AUTH] Authentication cancelled or closed. Exiting.")
+        sys.exit(0)
+        
+    auth_user_id = auth_result["user"].id
+    current_profile = auth_result["profile"]
+    print(f"[AUTH] Logged in user: {current_profile.get('name')}")
+
+    # Load user's preferred language from profile
+    selected_language = current_profile.get("preferred_language", "English")
+    if selected_language not in ["English", "Tamil"]:
+        selected_language = "English"
+
     # ── Initialize translation engine (bilingual support) ────────────────────
-    translator = TranslationEngine(target_lang="English")
+    translator = TranslationEngine(target_lang=selected_language)
 
     # ── MediaPipe Hands ─────────────────────────────────────────────────────
     mp_hands = mp.solutions.hands
@@ -1897,7 +1929,6 @@ def main():
     print("[OK] Webcam opened. Press Q or ESC to quit.\n")
 
     # ── Language State ──────────────────────────────────────────────────────
-    selected_language = "English"  # Default: "English" or "Tamil"
 
     # ── Hand Tracking Stability & Hysteresis State Variables ────────────────
     landmark_smoother = AdaptiveLandmarkSmoother()
@@ -2326,7 +2357,7 @@ def main():
                     err_msg = None
                     try:
                         # Try to open WhatsApp Web (Phase 3)
-                        send_whatsapp_alert(kw, recognized, lang, conf)
+                        send_whatsapp_alert(kw, recognized, lang, conf, profile=current_profile)
                         whatsapp_status = "Success"
                     except Exception as wa_err:
                         err_msg = str(wa_err)
@@ -2471,6 +2502,25 @@ def main():
                 print("[LANG] Language switched to: English")
             feedback_message = f"Language: {selected_language}"
             feedback_timestamp = now
+
+        elif key in (ord("p"), ord("P")):
+            print("[PROFILE] Opening profile update window...")
+            import tkinter as tk
+            temp_root = tk.Tk()
+            temp_root.withdraw()  # Hide the main window
+            from auth_gui import edit_user_profile
+            updated_profile = edit_user_profile(temp_root, auth_user_id, current_profile)
+            if updated_profile:
+                current_profile = updated_profile
+                # Dynamically update language if it changed
+                new_lang = current_profile.get("preferred_language", "English")
+                if new_lang in ["English", "Tamil"] and new_lang != selected_language:
+                    selected_language = new_lang
+                    translator.target_lang = new_lang
+                    print(f"[PROFILE] Language auto-switched to: {selected_language}")
+                feedback_message = "Profile Updated"
+                feedback_timestamp = now
+            temp_root.destroy()
 
         elif key == 8:  # BACKSPACE
             if word_buffer:
