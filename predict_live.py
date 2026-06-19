@@ -44,7 +44,9 @@ Requirements:
 """
 
 # ── Suppress noisy logs ────────────────────────────────────────────────────
-import os, warnings, logging
+import logging
+import os
+import warnings
 
 os.environ["GLOG_minloglevel"] = "3"
 os.environ["TF_CPP_MIN_LOG_LEVEL"] = "3"
@@ -53,35 +55,155 @@ logging.getLogger("httpx").setLevel(logging.WARNING)
 
 # ── Monkeypatch httpcore for googletrans compatibility ──────────────────────
 import httpcore
+
 if not hasattr(httpcore, "SyncHTTPTransport"):
+
     class DummySyncHTTPTransport:
         pass
+
     httpcore.SyncHTTPTransport = DummySyncHTTPTransport
 
 # ── Imports ─────────────────────────────────────────────────────────────────
-import sys
-import time
 import functools
+import sys
 import threading
-import numpy as np
+import time
+from collections import Counter, deque
+
 import cv2
-import mediapipe as mp
 import joblib
-import pyttsx3
+import mediapipe as mp
+import numpy as np
 import pythoncom
-from collections import deque, Counter
-from supabase_client import SupabaseManager
-from utils import extract_enhanced_features, extract_raw_normalized_landmarks  # Enhanced landmarks and engineered features
+import pyttsx3
+
 from emotion_detection import EmotionDetector
+from supabase_client import SupabaseManager
+from utils import (  # Enhanced landmarks and engineered features
+    extract_enhanced_features,
+    extract_raw_normalized_landmarks,
+)
 
 # ── Optional: PIL for Unicode (Tamil) text rendering ────────────────────
 try:
     from PIL import Image, ImageDraw, ImageFont
+
     PIL_AVAILABLE = True
 except ImportError:
     PIL_AVAILABLE = False
     print("[WARN] PIL/Pillow not installed. Tamil text display will use fallback.")
     print("       Install with: pip install Pillow")
+
+# ── Tkinter for Startup Form ────────────────────────────────────────────────
+import tkinter as tk
+from tkinter import ttk
+from tkinter import messagebox
+
+# ── Global session user (no auth, no login) ─────────────────────────────────
+current_user = {}
+
+
+def get_user_details():
+    """Show a startup form to collect user info before launching the recognition system."""
+    root = tk.Tk()
+    root.title("VisionSpeak - User Information")
+    root.resizable(False, False)
+
+    frame = ttk.Frame(root, padding="30")
+    frame.pack(fill=tk.BOTH, expand=True)
+
+    # Title
+    ttk.Label(frame, text="VisionSpeak", font=("Helvetica", 20, "bold")).grid(
+        row=0, column=0, columnspan=2, pady=(0, 5)
+    )
+    ttk.Label(frame, text="Sign Language Communication System", font=("Helvetica", 10)).grid(
+        row=1, column=0, columnspan=2, pady=(0, 25)
+    )
+
+    # Full Name
+    ttk.Label(frame, text="Full Name:").grid(row=2, column=0, sticky=tk.W, pady=5)
+    name_var = tk.StringVar()
+    name_entry = ttk.Entry(frame, textvariable=name_var, width=32)
+    name_entry.grid(row=2, column=1, sticky=tk.W, pady=5)
+
+    # Age
+    ttk.Label(frame, text="Age:").grid(row=3, column=0, sticky=tk.W, pady=5)
+    age_var = tk.StringVar()
+    age_entry = ttk.Entry(frame, textvariable=age_var, width=32)
+    age_entry.grid(row=3, column=1, sticky=tk.W, pady=5)
+
+    # Phone Number
+    ttk.Label(frame, text="Phone Number:").grid(row=4, column=0, sticky=tk.W, pady=5)
+    phone_var = tk.StringVar()
+    phone_entry = ttk.Entry(frame, textvariable=phone_var, width=32)
+    phone_entry.grid(row=4, column=1, sticky=tk.W, pady=5)
+
+    # Emergency Contact Number
+    ttk.Label(frame, text="Emergency Contact:").grid(row=5, column=0, sticky=tk.W, pady=5)
+    emergency_var = tk.StringVar()
+    emergency_entry = ttk.Entry(frame, textvariable=emergency_var, width=32)
+    emergency_entry.grid(row=5, column=1, sticky=tk.W, pady=5)
+
+    # Preferred Language
+    ttk.Label(frame, text="Preferred Language:").grid(row=6, column=0, sticky=tk.W, pady=5)
+    language_var = tk.StringVar(value="English")
+    language_combo = ttk.Combobox(
+        frame, textvariable=language_var, values=["English", "Tamil"],
+        state="readonly", width=29
+    )
+    language_combo.grid(row=6, column=1, sticky=tk.W, pady=5)
+
+    result = {}
+
+    def on_submit():
+        name = name_var.get().strip()
+        age_str = age_var.get().strip()
+        phone = phone_var.get().strip()
+        emergency = emergency_var.get().strip()
+        language = language_var.get()
+
+        if not name:
+            messagebox.showerror("Error", "Please enter your full name.")
+            return
+        try:
+            age = int(age_str)
+            if age < 1 or age > 120:
+                messagebox.showerror("Error", "Age must be between 1 and 120.")
+                return
+        except ValueError:
+            messagebox.showerror("Error", "Please enter a valid age (1-120).")
+            return
+        if not phone:
+            messagebox.showerror("Error", "Please enter your phone number.")
+            return
+        if not emergency:
+            messagebox.showerror("Error", "Please enter your emergency contact number.")
+            return
+
+        result.clear()
+        result.update({
+            "name": name,
+            "age": age_str,
+            "phone_number": phone,
+            "emergency_contact": emergency,
+            "preferred_language": language,
+        })
+        root.destroy()
+
+    start_btn = ttk.Button(frame, text="Start VisionSpeak", command=on_submit)
+    start_btn.grid(row=7, column=0, columnspan=2, pady=25)
+
+    # Center window
+    root.update_idletasks()
+    w = root.winfo_width()
+    h = root.winfo_height()
+    x = (root.winfo_screenwidth() // 2) - (w // 2)
+    y = (root.winfo_screenheight() // 2) - (h // 2)
+    root.geometry(f"{w}x{h}+{x}+{y}")
+
+    root.mainloop()
+    return result if result else None
+
 
 # ── Paths ───────────────────────────────────────────────────────────────────
 MODEL_PATH = os.path.join("models", "mlp_model.pkl")
@@ -113,9 +235,9 @@ MP_MIN_TRACKING_CONFIDENCE = 0.70
 # Motion-adaptive smoothing: low alpha = more smoothing, high alpha = more responsive.
 # When hand is stationary → alpha_slow (stable, reduces jitter)
 # When hand moves quickly  → alpha_fast (near-raw, eliminates lag)
-EMA_ALPHA_SLOW = 0.4          # Smoothing alpha when hand is stationary
-EMA_ALPHA_FAST = 0.9          # Smoothing alpha when hand moves fast
-EMA_SPEED_THRESHOLD = 0.01    # Landmark displacement threshold for fast mode
+EMA_ALPHA_SLOW = 0.4  # Smoothing alpha when hand is stationary
+EMA_ALPHA_FAST = 0.9  # Smoothing alpha when hand moves fast
+EMA_SPEED_THRESHOLD = 0.01  # Landmark displacement threshold for fast mode
 
 # ── Hysteresis Configuration ───────────────────────────────────────────────
 # HAND_MISSING_GRACE_FRAMES=5: continue displaying last valid landmarks for
@@ -136,38 +258,197 @@ WEBCAM_HEIGHT = 1080
 MOTION_THRESHOLD = 0.015
 
 # ── Hand Quality Thresholds ────────────────────────────────────────────────
-HAND_EDGE_MARGIN = 0.02          # 2% margin from frame edges
-HAND_MIN_BBOX_SIZE = 0.12        # minimum bounding box dimension (12% of frame)
-HAND_MIN_LANDMARK_SPREAD = 0.02   # minimum std-dev of landmark positions
+HAND_EDGE_MARGIN = 0.02  # 2% margin from frame edges
+HAND_MIN_BBOX_SIZE = 0.12  # minimum bounding box dimension (12% of frame)
+HAND_MIN_LANDMARK_SPREAD = 0.02  # minimum std-dev of landmark positions
 STABILITY_BUFFER_SIZE = 10
 STABILITY_MAX_VARIANCE = 0.005
 
 # ── Temporal Logic Configuration ────────────────────────────────────────────
-HISTORY_SIZE = 10             # Number of frames for majority voting (reduced from 30 for responsiveness)
+HISTORY_SIZE = (
+    20  # PHASE 9: 20 frames for majority voting (increased from 10 for stability)
+)
 CONSISTENCY_THRESHOLD = 0.80  # >80% of history must agree for a "stable" prediction
-CONFIDENCE_THRESHOLD = 0.90   # Model confidence must exceed 90%
-HOLD_TIME_REQUIRED = 0.5      # Seconds the prediction must be held before committing
+CONFIDENCE_THRESHOLD = 0.90  # Model confidence must exceed 90%
+HOLD_TIME_REQUIRED = 1.0  # PHASE 9: 1.0 second hold time (increased from 0.5s)
 FEEDBACK_DISPLAY_DURATION = 1.0  # Seconds to show "Added X" confirmation
 
+# ── Confidence Calibration (PHASE 6) ────────────────────────────────────────
+TEMPERATURE_SCALE = 1.988  # Learned from collision_audit.py
+
+# ── Collision Detection Threshold ────────────────────────────────────────────
+COLLISION_RISK_THRESHOLD = 0.15  # If top-2 diff < 15%, check rules
+
 # ── TTS Configuration ──────────────────────────────────────────────────────
-TTS_SPEECH_RATE = 150         # Words per minute
-TTS_VOLUME = 1.0              # 0.0 to 1.0
-AUTO_CLEAR = True             # Clear sentence buffer automatically after speaking
+TTS_SPEECH_RATE = 150  # Words per minute
+TTS_VOLUME = 1.0  # 0.0 to 1.0
+AUTO_CLEAR = True  # Clear sentence buffer automatically after speaking
+
+# ═══════════════════════════════════════════════════════════════════════════
+# PHASE 5 — Collision Rule Engine
+# ═══════════════════════════════════════════════════════════════════════════
+
+class CollisionRuleEngine:
+    """
+    Rule-based verification layer for highly confused letter pairs.
+    After the MLP prediction, these geometric rules verify or correct the output.
+    """
+    def __init__(self):
+        self.rules = self._build_rules()
+
+    def _build_rules(self):
+        return {
+            ("G", "H"): self._rule_finger_count_gh,
+            ("H", "G"): self._rule_finger_count_gh,
+            ("M", "N"): self._rule_mn,
+            ("N", "M"): self._rule_mn,
+            ("U", "V"): self._rule_uv,
+            ("V", "U"): self._rule_uv,
+            ("C", "O"): self._rule_co,
+            ("O", "C"): self._rule_co,
+            ("S", "T"): self._rule_st,
+            ("T", "S"): self._rule_st,
+            ("W", "E"): self._rule_we,
+            ("E", "W"): self._rule_we,
+            ("D", "F"): self._rule_df,
+            ("F", "D"): self._rule_df,
+        }
+
+    def _extract(self, landmarks_21x3):
+        coords = landmarks_21x3.reshape(21, 3)
+        wrist = coords[0]
+        translated = coords - wrist
+        scale = np.linalg.norm(translated[9])
+        if scale < 1e-6:
+            scale = 1.0
+        return translated / scale
+
+    def count_fingers(self, landmarks_21x3):
+        n = self._extract(landmarks_21x3)
+        thumb = np.linalg.norm(n[4] - n[5]) > 0.8
+        index = np.linalg.norm(n[8]) > np.linalg.norm(n[6])
+        middle = np.linalg.norm(n[12]) > np.linalg.norm(n[10])
+        ring = np.linalg.norm(n[16]) > np.linalg.norm(n[14])
+        pinky = np.linalg.norm(n[20]) > np.linalg.norm(n[18])
+        return sum([thumb, index, middle, ring, pinky])
+
+    def _rule_finger_count_gh(self, landmarks, _):
+        fc = self.count_fingers(landmarks)
+        if fc <= 1:
+            return "G", 0.95
+        elif fc >= 2:
+            return "H", 0.90
+        return None, 0.0
+
+    def _rule_mn(self, landmarks, _):
+        n = self._extract(landmarks)
+        index = np.linalg.norm(n[8]) > np.linalg.norm(n[6])
+        middle = np.linalg.norm(n[12]) > np.linalg.norm(n[10])
+        ring = np.linalg.norm(n[16]) > np.linalg.norm(n[14])
+        extended = sum([index, middle, ring])
+        if extended >= 3:
+            return "M", 0.85
+        elif extended <= 2:
+            return "N", 0.85
+        thumb_idx_dist = np.linalg.norm(n[4] - n[5])
+        if thumb_idx_dist < 0.6:
+            return "M", 0.70
+        return None, 0.0
+
+    def _rule_uv(self, landmarks, _):
+        n = self._extract(landmarks)
+        idx_mid_dist = np.linalg.norm(n[8] - n[12])
+        if idx_mid_dist < 0.3:
+            return "U", 0.90
+        elif idx_mid_dist >= 0.3:
+            return "V", 0.90
+        return None, 0.0
+
+    def _rule_co(self, landmarks, _):
+        n = self._extract(landmarks)
+        thumb_tip = n[4]; index_tip = n[8]
+        dist = np.linalg.norm(thumb_tip - index_tip)
+        if dist < 0.2:
+            return "O", 0.85
+        elif dist >= 0.3:
+            return "C", 0.85
+        return None, 0.0
+
+    def _rule_st(self, landmarks, _):
+        fc = self.count_fingers(landmarks)
+        if fc == 0:
+            return "S", 0.90
+        n = self._extract(landmarks)
+        thumb_ext = np.linalg.norm(n[4] - n[5]) > 0.8
+        if thumb_ext:
+            return "T", 0.80
+        return None, 0.0
+
+    def _rule_we(self, landmarks, _):
+        fc = self.count_fingers(landmarks)
+        if fc >= 3:
+            return "W", 0.85
+        elif fc <= 1:
+            return "E", 0.80
+        return None, 0.0
+
+    def _rule_df(self, landmarks, _):
+        n = self._extract(landmarks)
+        index_up = np.linalg.norm(n[8]) > np.linalg.norm(n[6])
+        thumb_idx_dist = np.linalg.norm(n[4] - n[5])
+        fc = self.count_fingers(landmarks)
+        if index_up and fc == 1:
+            return "D", 0.90
+        if thumb_idx_dist < 0.2 and index_up:
+            return "F", 0.85
+        return None, 0.0
+
+    def verify(self, raw_prediction, second_prediction, landmarks_21x3):
+        if raw_prediction is None or second_prediction is None:
+            return raw_prediction, None, False, None
+
+        rule_key = (raw_prediction, second_prediction)
+        rev_key = (second_prediction, raw_prediction)
+        rule_fn = self.rules.get(rule_key) or self.rules.get(rev_key)
+        if rule_fn is not None:
+            corrected, rule_conf = rule_fn(landmarks_21x3, None)
+            if corrected is not None and corrected != raw_prediction:
+                return corrected, rule_conf, True, f"{rule_key[0]}/{rule_key[1]}"
+
+        return raw_prediction, None, False, None
+
+
+def calibrate_confidence(logits, temperature=TEMPERATURE_SCALE):
+    """Apply temperature scaling to logits for calibrated confidence."""
+    scaled = logits / temperature
+    exp_s = np.exp(scaled - scaled.max(axis=1, keepdims=True))
+    return exp_s / exp_s.sum(axis=1, keepdims=True)
+
+
+def extract_landmarks_for_rules(hand_lm):
+    """Extract 21x3 landmark array from MediaPipe or raw format for rule engine."""
+    if hasattr(hand_lm, "landmark"):
+        return np.array(
+            [[lm.x, lm.y, lm.z] for lm in hand_lm.landmark],
+            dtype=np.float32
+        ).reshape(21, 3)
+    return np.array(hand_lm, dtype=np.float32).reshape(21, 3)
+
 
 # ── Colours (BGR) ───────────────────────────────────────────────────────────
-BG_DARK = (30, 20, 20)            # Deep obsidian slate (semi-transparent)
-BORDER_COLOR = (120, 40, 90)      # Neon dark purple outline
-ACCENT_COLOR = (208, 194, 0)      # Neon Cyan/Teal accent
-TEAL = (208, 194, 0)              # Neon Cyan
-TEAL_LIGHT = (230, 220, 100)      # Light Cyan
+BG_DARK = (30, 20, 20)  # Deep obsidian slate (semi-transparent)
+BORDER_COLOR = (120, 40, 90)  # Neon dark purple outline
+ACCENT_COLOR = (208, 194, 0)  # Neon Cyan/Teal accent
+TEAL = (208, 194, 0)  # Neon Cyan
+TEAL_LIGHT = (230, 220, 100)  # Light Cyan
 WHITE = (255, 255, 255)
-GREEN = (100, 255, 100)           # Cyber lime green
-RED = (80, 80, 255)               # Warning red
-YELLOW = (60, 220, 255)           # Alert orange/yellow
+GREEN = (100, 255, 100)  # Cyber lime green
+RED = (80, 80, 255)  # Warning red
+YELLOW = (60, 220, 255)  # Alert orange/yellow
 GRAY = (140, 140, 140)
-ORANGE = (30, 140, 255)           # Electric orange
+ORANGE = (30, 140, 255)  # Electric orange
 CYAN = (255, 255, 0)
-PURPLE = (220, 80, 220)           # Tech purple
+PURPLE = (220, 80, 220)  # Tech purple
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -184,8 +465,16 @@ AVAILABLE_LANGUAGES = list(LANGUAGE_CONFIG.keys())
 # ── Emergency Configuration ──────────────────────────────────────────────────
 EMERGENCY_KEYWORDS = {
     "English": ["HELP ME", "HELP", "EMERGENCY", "AMBULANCE", "HOSPITAL", "DOCTOR"],
-    "Tamil": ["எனக்கு உதவி வேண்டும்", "உதவி", "அவசரம்", "ஆம்புலன்ஸ்", "மருத்துவமனை", "மருத்துவர்"]
+    "Tamil": [
+        "எனக்கு உதவி வேண்டும்",
+        "உதவி",
+        "அவசரம்",
+        "ஆம்புலன்ஸ்",
+        "மருத்துவமனை",
+        "மருத்துவர்",
+    ],
 }
+
 
 def is_emergency_text(text: str) -> str | None:
     """
@@ -194,10 +483,11 @@ def is_emergency_text(text: str) -> str | None:
     """
     if not text:
         return None
-    
+
     import re
+
     upper_text = text.upper()
-    
+
     # Check English keywords using word boundaries to avoid matching substrings of other words
     for kw in EMERGENCY_KEYWORDS["English"]:
         pattern = r"\b" + re.escape(kw) + r"\b"
@@ -267,7 +557,7 @@ TRANSLATION_DICT = {
         "COLD": "குளிர்",
         "HI": "வணக்கம்",
         "GOOD": "நல்லது",
-        "HELP ME": "எனக்கு உதவி வேண்டும்"
+        "HELP ME": "எனக்கு உதவி வேண்டும்",
     }
 }
 
@@ -330,6 +620,7 @@ TAMIL_PHONETIC_DICT = {
     "எனக்கு உதவி வேண்டும்": "enakku udhavi vendum",
 }
 
+
 def transliterate_tamil_text(text: str) -> str:
     """
     Transliterates Tamil Unicode text into Romanized phonetic English fallback
@@ -337,12 +628,12 @@ def transliterate_tamil_text(text: str) -> str:
     """
     if not text:
         return text
-        
+
     cleaned = text.strip()
     # Check direct match
     if cleaned in TAMIL_PHONETIC_DICT:
         return TAMIL_PHONETIC_DICT[cleaned]
-        
+
     # Split text into words/phrases and check
     words = cleaned.split()
     romanized_words = []
@@ -362,7 +653,7 @@ def transliterate_tamil_text(text: str) -> str:
                 romanized_words.append(found_eng.lower())
             else:
                 pass
-                
+
     if romanized_words:
         return " ".join(romanized_words)
     return ""
@@ -370,6 +661,7 @@ def transliterate_tamil_text(text: str) -> str:
 
 # ── Global Translator & Cache for Real-Time Translation ──────────────────────
 _translation_cache = {}
+
 
 def translate_to_tamil(text: str) -> str:
     """
@@ -391,8 +683,10 @@ def translate_to_tamil(text: str) -> str:
             print(log_str)
         except Exception:
             try:
-                enc = sys.stdout.encoding or 'utf-8'
-                print(log_str.encode(enc, errors='replace').decode(enc, errors='replace'))
+                enc = sys.stdout.encoding or "utf-8"
+                print(
+                    log_str.encode(enc, errors="replace").decode(enc, errors="replace")
+                )
             except Exception:
                 pass
 
@@ -412,26 +706,41 @@ def translate_to_tamil(text: str) -> str:
     # 3. Call deep-translator API
     try:
         from deep_translator import GoogleTranslator
-        translated_text = GoogleTranslator(source='en', target='ta').translate(cleaned_text)
+
+        translated_text = GoogleTranslator(source="en", target="ta").translate(
+            cleaned_text
+        )
         if translated_text:
             _translation_cache[cleaned_text] = translated_text
-            log_translation(cleaned_text, "No", "GoogleTranslator API (Success)", translated_text)
+            log_translation(
+                cleaned_text, "No", "GoogleTranslator API (Success)", translated_text
+            )
             return translated_text
         else:
-            log_translation(cleaned_text, "No", "GoogleTranslator API (Failed - Empty)", cleaned_text)
+            log_translation(
+                cleaned_text,
+                "No",
+                "GoogleTranslator API (Failed - Empty)",
+                cleaned_text,
+            )
             _translation_cache[cleaned_text] = cleaned_text
             return cleaned_text
     except Exception as e:
         print(f"[ERROR] Tamil Translation Failed: {e}")
         _translation_cache[cleaned_text] = cleaned_text
-        log_translation(cleaned_text, "No", f"GoogleTranslator API (Failed - Error: {e})", cleaned_text)
+        log_translation(
+            cleaned_text,
+            "No",
+            f"GoogleTranslator API (Failed - Error: {e})",
+            cleaned_text,
+        )
         return cleaned_text
-
 
 
 # ═══════════════════════════════════════════════════════════════════════════
 # Translation Engine (modular design for multilingual support)
 # ═══════════════════════════════════════════════════════════════════════════
+
 
 class TranslationEngine:
     """
@@ -496,12 +805,12 @@ class TranslationEngine:
         """
         try:
             from deep_translator import GoogleTranslator
+
             target_code = LANGUAGE_CONFIG.get(self.target_lang, {}).get("code", "en")
-            return GoogleTranslator(source='en', target=target_code).translate(text)
+            return GoogleTranslator(source="en", target=target_code).translate(text)
         except Exception as e:
             print(f"[WARN] Translation failed (offline or API error): {e}")
             return text
-
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -567,9 +876,7 @@ class SpeechEngine:
 
         # Launch persistent worker thread
         self._worker_thread = threading.Thread(
-            target=self._worker_loop,
-            name="SpeechWorkerThread",
-            daemon=True
+            target=self._worker_loop, name="SpeechWorkerThread", daemon=True
         )
         self._worker_thread.start()
 
@@ -578,6 +885,7 @@ class SpeechEngine:
     def _worker_loop(self):
         """Persistent background worker loop that handles speech requests."""
         import pythoncom
+
         pythoncom.CoInitialize()
 
         # Set engine ready event immediately for backward compatibility
@@ -607,7 +915,9 @@ class SpeechEngine:
 
             # Diagnostic logs after every request received
             worker_alive = self._worker_thread.is_alive()
-            print(f"[DEBUG TTS] Worker Alive: {worker_alive} | Queue Size: {self._queue.qsize()} | Status: {self._status} | is_speaking: {self._is_speaking_val}")
+            print(
+                f"[DEBUG TTS] Worker Alive: {worker_alive} | Queue Size: {self._queue.qsize()} | Status: {self._status} | is_speaking: {self._is_speaking_val}"
+            )
 
             # Verify Tamil text reaches the speech engine
             try:
@@ -616,7 +926,9 @@ class SpeechEngine:
             except Exception:
                 try:
                     print(f"[DEBUG] Language: {language}")
-                    print(f"[DEBUG] Text To Speak: {text.encode('utf-8', errors='replace')}")
+                    print(
+                        f"[DEBUG] Text To Speak: {text.encode('utf-8', errors='replace')}"
+                    )
                 except Exception:
                     pass
 
@@ -628,6 +940,7 @@ class SpeechEngine:
                     # 1. Attempt Tamil Audio Generation using gTTS
                     try:
                         from gtts import gTTS
+
                         tts_obj = gTTS(text=text, lang="ta")
                         tts_obj.save(temp_file_path)
                     except Exception as e:
@@ -637,6 +950,7 @@ class SpeechEngine:
                     if os.path.exists(temp_file_path):
                         try:
                             import pygame
+
                             if not pygame.mixer.get_init():
                                 pygame.mixer.init()
                             pygame.mixer.music.load(temp_file_path)
@@ -666,29 +980,43 @@ class SpeechEngine:
 
                     # 3. Fallback: Speak transliterated Tamil using English voice if gTTS/pygame failed
                     if not tamil_tts_success:
-                        print("[TTS] Tamil TTS failed. Falling back to phonetic transliteration...")
+                        print(
+                            "[TTS] Tamil TTS failed. Falling back to phonetic transliteration..."
+                        )
                         phonetic_text = transliterate_tamil_text(text)
                         if phonetic_text and phonetic_text.strip():
                             fallback_text = phonetic_text
-                            print(f"[TTS] Using phonetic Tamil transliteration: {fallback_text}")
+                            print(
+                                f"[TTS] Using phonetic Tamil transliteration: {fallback_text}"
+                            )
                         elif english_fallback and english_fallback.strip():
                             fallback_text = english_fallback
-                            print(f"[TTS] Transliteration empty. Using English fallback: {fallback_text}")
+                            print(
+                                f"[TTS] Transliteration empty. Using English fallback: {fallback_text}"
+                            )
                         else:
                             fallback_text = text
-                            print("[TTS] Transliteration empty and no English fallback. Playing original Tamil.")
+                            print(
+                                "[TTS] Transliteration empty and no English fallback. Playing original Tamil."
+                            )
 
                         # Create fresh pyttsx3 engine for the fallback request
                         engine = None
                         try:
                             engine = pyttsx3.init()
                             engine.setProperty("rate", TTS_SPEECH_RATE)
-                            engine.setProperty("volume", volume if volume is not None else TTS_VOLUME)
+                            engine.setProperty(
+                                "volume", volume if volume is not None else TTS_VOLUME
+                            )
                             try:
                                 voices = engine.getProperty("voices")
                                 for voice in voices:
-                                    voice_name = voice.name.lower() if hasattr(voice, 'name') else ""
-                                    if 'tamil' not in voice_name:
+                                    voice_name = (
+                                        voice.name.lower()
+                                        if hasattr(voice, "name")
+                                        else ""
+                                    )
+                                    if "tamil" not in voice_name:
                                         engine.setProperty("voice", voice.id)
                                         break
                             except Exception:
@@ -714,12 +1042,16 @@ class SpeechEngine:
                     try:
                         engine = pyttsx3.init()
                         engine.setProperty("rate", TTS_SPEECH_RATE)
-                        engine.setProperty("volume", volume if volume is not None else TTS_VOLUME)
+                        engine.setProperty(
+                            "volume", volume if volume is not None else TTS_VOLUME
+                        )
                         try:
                             voices = engine.getProperty("voices")
                             for voice in voices:
-                                voice_name = voice.name.lower() if hasattr(voice, 'name') else ""
-                                if 'tamil' not in voice_name:
+                                voice_name = (
+                                    voice.name.lower() if hasattr(voice, "name") else ""
+                                )
+                                if "tamil" not in voice_name:
                                     engine.setProperty("voice", voice.id)
                                     break
                         except Exception:
@@ -754,7 +1086,9 @@ class SpeechEngine:
 
                 # Diagnostic logs after request processed
                 worker_alive = self._worker_thread.is_alive()
-                print(f"[DEBUG TTS] Worker Alive: {worker_alive} | Queue Size: {self._queue.qsize()} | Status: {self.status} | is_speaking: {self.is_speaking}")
+                print(
+                    f"[DEBUG TTS] Worker Alive: {worker_alive} | Queue Size: {self._queue.qsize()} | Status: {self.status} | is_speaking: {self.is_speaking}"
+                )
 
         pythoncom.CoUninitialize()
 
@@ -765,9 +1099,11 @@ class SpeechEngine:
         """Current speech status: READY, SPEAKING, or COMPLETED."""
         with self._status_lock:
             # Auto-transition COMPLETED → READY after the display duration
-            if (self._status == self.STATUS_COMPLETED
-                    and time.time() - self._completed_timestamp
-                    > self._completed_display_duration):
+            if (
+                self._status == self.STATUS_COMPLETED
+                and time.time() - self._completed_timestamp
+                > self._completed_display_duration
+            ):
                 self._status = self.STATUS_READY
             return self._status
 
@@ -789,7 +1125,13 @@ class SpeechEngine:
                 return True
             return False
 
-    def speak(self, text: str, language: str = "English", volume: float = None, english_fallback: str = "") -> bool:
+    def speak(
+        self,
+        text: str,
+        language: str = "English",
+        volume: float = None,
+        english_fallback: str = "",
+    ) -> bool:
         """
         Queue a speech request to be processed by the background worker thread.
 
@@ -811,10 +1153,12 @@ class SpeechEngine:
         # Push to the thread-safe queue
         self._queue.put((clean_text, language, volume, english_fallback))
         print("[DEBUG] Queue Accepted")
-        
+
         # Diagnostic logs on the main thread after queuing
         worker_alive = self._worker_thread.is_alive()
-        print(f"[DEBUG TTS] Queue Size: {self._queue.qsize()} | Worker Alive: {worker_alive} | Status: {self.status} | is_speaking: {self.is_speaking}")
+        print(
+            f"[DEBUG TTS] Queue Size: {self._queue.qsize()} | Worker Alive: {worker_alive} | Status: {self.status} | is_speaking: {self.is_speaking}"
+        )
         return True
 
     def shutdown(self):
@@ -824,26 +1168,30 @@ class SpeechEngine:
             self._worker_thread.join(timeout=1.0)
 
 
-
-def save_recognition(recognized_text: str, translated_text: str = "",
-                     selected_language: str = "English", confidence: float = 100.0) -> bool:
+def save_recognition(
+    recognized_text: str,
+    translated_text: str = "",
+    selected_language: str = "English",
+    confidence: float = 100.0,
+) -> bool:
     """
     Saves the recognized text, translation, language, confidence, and timestamp to Supabase.
     """
     try:
         from datetime import datetime, timezone
+
         timestamp = datetime.now(timezone.utc).isoformat()
-        
+
         sb = SupabaseManager()
-        
+
         data = {
             "recognized_text": recognized_text,
             "translated_text": translated_text,
             "selected_language": selected_language,
             "confidence": confidence,
-            "created_at": timestamp
+            "created_at": timestamp,
         }
-        
+
         res = sb.insert("recognition_history", data)
         if res is not None:
             print("[DB] Saved Successfully")
@@ -851,7 +1199,7 @@ def save_recognition(recognized_text: str, translated_text: str = "",
         else:
             print("[DB] Save Failed")
             return False
-            
+
     except Exception as e:
         print("[DB] Save Failed")
         print(f"     Error: {e}")
@@ -864,7 +1212,13 @@ def get_recent_history() -> list | None:
     """
     try:
         sb = SupabaseManager()
-        res = sb.client.table("recognition_history").select("*").order("created_at", descending=True).limit(20).execute()
+        res = (
+            sb.client.table("recognition_history")
+            .select("*")
+            .order("created_at", descending=True)
+            .limit(20)
+            .execute()
+        )
         return res.data
     except Exception as e:
         print(f"[DB] Error fetching history: {e}")
@@ -873,9 +1227,11 @@ def get_recent_history() -> list | None:
 
 # ── Emergency Assistance Mode Modules ────────────────────────────────────────
 
+
 def _play_emergency_sound():
     """Plays a non-blocking siren tone using Windows winsound."""
     import winsound
+
     try:
         # Playing a high-low siren tone
         for _ in range(3):
@@ -887,31 +1243,39 @@ def _play_emergency_sound():
 
 def trigger_sound_alert():
     """Trigger the emergency sound alert in a separate background thread."""
-    threading.Thread(target=_play_emergency_sound, name="EmergencySoundThread", daemon=True).start()
+    threading.Thread(
+        target=_play_emergency_sound, name="EmergencySoundThread", daemon=True
+    ).start()
 
 
-def save_emergency_event(detected_keyword: str, recognized_text: str,
-                         translated_text: str = "", language: str = "English",
-                         confidence: float = 100.0, error_message: str = None) -> bool:
+def save_emergency_event(
+    detected_keyword: str,
+    recognized_text: str,
+    translated_text: str = "",
+    language: str = "English",
+    confidence: float = 100.0,
+    error_message: str = None,
+) -> bool:
     """
     Saves the emergency event details to the Supabase table `emergency_events`.
     If error_message is provided, attempts to save it, falling back to a normal save if the column is missing.
     """
     try:
         from datetime import datetime, timezone
+
         timestamp = datetime.now(timezone.utc).isoformat()
-        
+
         sb = SupabaseManager()
-        
+
         data = {
             "detected_keyword": detected_keyword,
             "recognized_text": recognized_text,
             "translated_text": translated_text,
             "language": language,
             "confidence": confidence,
-            "created_at": timestamp
+            "created_at": timestamp,
         }
-        
+
         if error_message:
             try:
                 # Try inserting with error_message first
@@ -922,8 +1286,10 @@ def save_emergency_event(detected_keyword: str, recognized_text: str,
                     print("[DB] Emergency Event and Error Saved Successfully")
                     return True
             except Exception as db_err:
-                print(f"[DB] Failed to insert with error_message column: {db_err}. Falling back to normal insert.")
-        
+                print(
+                    f"[DB] Failed to insert with error_message column: {db_err}. Falling back to normal insert."
+                )
+
         res = sb.insert("emergency_events", data)
         if res is not None:
             print("[DB] Emergency Event Saved Successfully")
@@ -943,7 +1309,13 @@ def get_emergency_history() -> list | None:
     """
     try:
         sb = SupabaseManager()
-        res = sb.client.table("emergency_events").select("*").order("created_at", desc=True).limit(5).execute()
+        res = (
+            sb.client.table("emergency_events")
+            .select("*")
+            .order("created_at", desc=True)
+            .limit(5)
+            .execute()
+        )
         return res.data
     except Exception as e:
         print(f"[DB] Error fetching emergency history: {e}")
@@ -962,13 +1334,16 @@ def print_emergency_history():
             msg = event.get("recognized_text", "N/A")
             created_at = event.get("created_at", "N/A")
             lang = event.get("language", "English")
-            
+
             try:
                 from datetime import datetime
-                time_part = datetime.fromisoformat(created_at.replace("Z", "+00:00")).strftime("%Y-%m-%d %H:%M:%S")
+
+                time_part = datetime.fromisoformat(
+                    created_at.replace("Z", "+00:00")
+                ).strftime("%Y-%m-%d %H:%M:%S")
             except Exception:
                 time_part = created_at
-                
+
             print(f"[{time_part}] | Language: {lang} | Keyword: {kw}")
             print(f"  Recognized Text: {msg}")
             print("-" * 58)
@@ -981,11 +1356,19 @@ def get_emergency_count_today() -> int:
     """
     try:
         from datetime import datetime, timezone
+
         now_utc = datetime.now(timezone.utc)
-        today_start = datetime(now_utc.year, now_utc.month, now_utc.day, tzinfo=timezone.utc).isoformat()
-        
+        today_start = datetime(
+            now_utc.year, now_utc.month, now_utc.day, tzinfo=timezone.utc
+        ).isoformat()
+
         sb = SupabaseManager()
-        res = sb.client.table("emergency_events").select("id", count="exact").gte("created_at", today_start).execute()
+        res = (
+            sb.client.table("emergency_events")
+            .select("id", count="exact")
+            .gte("created_at", today_start)
+            .execute()
+        )
         return res.count if res.count is not None else len(res.data)
     except Exception as e:
         print(f"[DB] Error getting today's emergency count: {e}")
@@ -994,27 +1377,34 @@ def get_emergency_count_today() -> int:
 
 # ── Future-Ready Notification Hooks (Optional Modules) ────────────────────────
 
+
 def send_sms_alert(keyword: str, recognized_text: str, language: str):
     """Optional future module: SMS Integration (e.g., Twilio)."""
     pass
 
 
-def send_whatsapp_alert(keyword: str, recognized_text: str, language: str, confidence: float = 100.0, profile: dict = None) -> bool:
+def send_whatsapp_alert(
+    keyword: str,
+    recognized_text: str,
+    language: str,
+    confidence: float = 100.0,
+) -> bool:
     """
     Formats the emergency message using Indian Standard Time (IST) and location coordinates,
     URL-encodes it, and opens WhatsApp Web targeting the user's emergency contact.
-    Raises exceptions on failure for error handling.
+    Uses the global current_user session data (set by the startup form).
     """
+    global current_user
     try:
-        import webbrowser
         import urllib.parse
-        from datetime import datetime, timezone, timedelta
-        
+        import webbrowser
+        from datetime import datetime, timedelta, timezone
+
         # 1. Use real Indian Standard Time (IST = UTC + 5:30)
         ist_tz = timezone(timedelta(hours=5, minutes=30))
         indian_time = datetime.now(ist_tz)
         indian_time_str = indian_time.strftime("%Y-%m-%d %H:%M:%S")
-        
+
         # 2. Get Geolocation & Google Maps Map Link
         loc = share_location()
         city = loc.get("city", "Unknown City")
@@ -1022,51 +1412,48 @@ def send_whatsapp_alert(keyword: str, recognized_text: str, language: str, confi
         country = loc.get("country", "Unknown Country")
         lat = loc.get("lat", 13.0827)
         lon = loc.get("lon", 80.2707)
-        
-        # 3. Retrieve User Profile Details from profile dict or env defaults
-        if profile:
-            user_name = profile.get("name", "Unknown User")
-            user_age = str(profile.get("age", "Unknown"))
-            emergency_contact = profile.get("emergency_contact", "919344347205")
-        else:
-            user_name = os.getenv("EMERGENCY_USER_NAME", "Ragav U")
-            user_age = os.getenv("EMERGENCY_USER_AGE", "21")
-            emergency_contact = "919344347205"
-        
+
+        # 3. Use session user data from startup form
+        user_name = current_user.get("name", "Unknown User")
+        user_age = current_user.get("age", "Unknown")
+        phone_number = current_user.get("phone_number", "")
+        emergency_contact = current_user.get("emergency_contact", "919344347205")
+
         # Format location details
         location_detail = f"{city}, {region}, {country} (Google Maps: https://maps.google.com/?q={lat},{lon})"
-        
-        # Format message according to the exact requested template
+
+        # Format message according to the requested template
         message = (
             f"VisionSpeak Emergency Alert\n\n"
             f"Name: {user_name}\n\n"
             f"Age: {user_age}\n\n"
+            f"Phone Number: {phone_number}\n\n"
+            f"Emergency Contact: {emergency_contact}\n\n"
             f"Location: {location_detail}\n\n"
             f"Assistance Required: {keyword}\n\n"
             f"Date and Time: {indian_time_str} (IST)\n\n"
             f"The user has requested assistance through the VisionSpeak Sign Language Communication System. Kindly provide the required support at the earliest."
         )
-        
+
         # URL-encode the message
         encoded_message = urllib.parse.quote(message)
-        
+
         # Clean up the emergency contact number (keep only digits)
         clean_contact = "".join(c for c in emergency_contact if c.isdigit())
         if len(clean_contact) == 10:
             clean_contact = "91" + clean_contact
-            
+
         url = f"https://wa.me/{clean_contact}?text={encoded_message}"
-        
+
         print(f"[WHATSAPP] Opening URL: {url}")
-        
+
         # Open default browser
         success = webbrowser.open(url)
         if not success:
             raise RuntimeError("webbrowser.open failed to launch browser")
-            
+
         return True
     except Exception as e:
-        # Re-raise so Phase 7 can catch and log
         raise e
 
 
@@ -1086,11 +1473,11 @@ def share_location() -> dict:
     using a free IP-based geolocation service. Falls back to default values on failure.
     """
     try:
-        import urllib.request
         import json
-        
+        import urllib.request
+
         url = "http://ip-api.com/json/"
-        req = urllib.request.Request(url, headers={'User-Agent': 'Mozilla/5.0'})
+        req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
         with urllib.request.urlopen(req, timeout=3) as response:
             data = json.loads(response.read().decode())
             if data.get("status") == "success":
@@ -1100,11 +1487,11 @@ def share_location() -> dict:
                     "city": data.get("city"),
                     "region": data.get("regionName"),
                     "country": data.get("country"),
-                    "success": True
+                    "success": True,
                 }
     except Exception as e:
         print(f"[LOCATION] Error fetching geolocation: {e}")
-        
+
     # Default fallback: Chennai, India coordinates
     return {
         "lat": 13.0827,
@@ -1112,13 +1499,14 @@ def share_location() -> dict:
         "city": "Chennai",
         "region": "Tamil Nadu",
         "country": "India",
-        "success": False
+        "success": False,
     }
 
 
 # ═══════════════════════════════════════════════════════════════════════════
 # Model & Feature Extraction
 # ═══════════════════════════════════════════════════════════════════════════
+
 
 def load_model():
     """Load the trained MLP model, label encoder, and scaler."""
@@ -1134,26 +1522,28 @@ def load_model():
     scaler = joblib.load(SCALER_PATH)
 
     # Determine model input dimension dynamically
-    if hasattr(scaler, 'n_features_in_'):
+    if hasattr(scaler, "n_features_in_"):
         num_feats = scaler.n_features_in_
-    elif hasattr(model, 'n_features_in_'):
+    elif hasattr(model, "n_features_in_"):
         num_feats = model.n_features_in_
     else:
         num_feats = 63  # default fallback
 
-    MODEL_EXPECTS_ENHANCED = (num_feats == 99)
+    MODEL_EXPECTS_ENHANCED = num_feats == 99
     print(f"[OK] Model, encoder, and scaler loaded. Expected features: {num_feats}")
     if not MODEL_EXPECTS_ENHANCED:
-        print("[WARN] Compatibility Mode Active: Loaded model expects 63 features (raw landmarks).")
-        print("       Please run train_mlp.py to retrain the model with 99 enhanced features for maximum stability.")
+        print(
+            "[WARN] Compatibility Mode Active: Loaded model expects 63 features (raw landmarks)."
+        )
+        print(
+            "       Please run train_mlp.py to retrain the model with 99 enhanced features for maximum stability."
+        )
     else:
-        print("[OK] Enhanced Feature Mode Active: Using 99 normalized & engineered features.")
+        print(
+            "[OK] Enhanced Feature Mode Active: Using 99 normalized & engineered features."
+        )
 
     return model, le, scaler
-
-
-
-
 
 
 def extract_landmarks(hand_landmarks) -> np.ndarray:
@@ -1171,8 +1561,10 @@ def count_extended_fingers(hand_landmarks) -> int:
     """
     try:
         # Extract 3D coordinates
-        if hasattr(hand_landmarks, 'landmark'):
-            coords = np.array([[lm.x, lm.y, lm.z] for lm in hand_landmarks.landmark], dtype=np.float32)
+        if hasattr(hand_landmarks, "landmark"):
+            coords = np.array(
+                [[lm.x, lm.y, lm.z] for lm in hand_landmarks.landmark], dtype=np.float32
+            )
         else:
             coords = np.array(hand_landmarks, dtype=np.float32).reshape(21, 3)
 
@@ -1192,7 +1584,9 @@ def count_extended_fingers(hand_landmarks) -> int:
 
         # Other fingers: extended if distance from tip to wrist is greater than PIP to wrist
         index_extended = np.linalg.norm(normalized[8]) > np.linalg.norm(normalized[6])
-        middle_extended = np.linalg.norm(normalized[12]) > np.linalg.norm(normalized[10])
+        middle_extended = np.linalg.norm(normalized[12]) > np.linalg.norm(
+            normalized[10]
+        )
         ring_extended = np.linalg.norm(normalized[16]) > np.linalg.norm(normalized[14])
         pinky_extended = np.linalg.norm(normalized[20]) > np.linalg.norm(normalized[18])
 
@@ -1214,43 +1608,50 @@ def count_extended_fingers(hand_landmarks) -> int:
         return -1
 
 
-
-
 # ═══════════════════════════════════════════════════════════════════════════
 # HUD Drawing Utilities
 # ═══════════════════════════════════════════════════════════════════════════
 
+
 def draw_unicode_text(frame, text, position, color, font_size=24, thickness=1):
     """Render Unicode text (Tamil, etc.) on an OpenCV frame using PIL by cropping the local area for performance."""
     if not PIL_AVAILABLE or not text:
-        cv2.putText(frame, text, position, cv2.FONT_HERSHEY_SIMPLEX,
-                    font_size / 30, (180, 180, 180), thickness, cv2.LINE_AA)
+        cv2.putText(
+            frame,
+            text,
+            position,
+            cv2.FONT_HERSHEY_SIMPLEX,
+            font_size / 30,
+            (180, 180, 180),
+            thickness,
+            cv2.LINE_AA,
+        )
         return
 
     try:
         h, w = frame.shape[:2]
         x, y = position
-        
+
         # Estimate text dimensions (generous padding)
         text_h = int(font_size * 1.6)
         text_w = int(len(text) * font_size * 1.2)
-        
+
         # Define bounding box for cropping (constrain within frame boundaries)
         x1 = max(0, x - 10)
         y1 = max(0, y - 5)
         x2 = min(w, x + text_w + 10)
         y2 = min(h, y + text_h + 5)
-        
+
         if x2 <= x1 or y2 <= y1:
             return
-            
+
         # Crop only the local region of interest
         roi = frame[y1:y2, x1:x2]
-        
+
         # Render text on ROI using PIL
         pil_img = Image.fromarray(cv2.cvtColor(roi, cv2.COLOR_BGR2RGB))
         draw = ImageDraw.Draw(pil_img)
-        
+
         font = None
         for font_path in [
             "C:/Windows/Fonts/Nirmala.ttf",
@@ -1264,16 +1665,24 @@ def draw_unicode_text(frame, text, position, color, font_size=24, thickness=1):
                 continue
         if font is None:
             font = ImageFont.load_default()
-            
+
         # Local text position is relative to ROI origin
         local_pos = (x - x1, y - y1)
         draw.text(local_pos, text, font=font, fill=color)
-        
+
         # Convert back and paste onto frame
         frame[y1:y2, x1:x2] = cv2.cvtColor(np.array(pil_img), cv2.COLOR_RGB2BGR)
     except Exception as e:
-        cv2.putText(frame, text, position, cv2.FONT_HERSHEY_SIMPLEX,
-                    font_size / 30, (180, 180, 180), thickness, cv2.LINE_AA)
+        cv2.putText(
+            frame,
+            text,
+            position,
+            cv2.FONT_HERSHEY_SIMPLEX,
+            font_size / 30,
+            (180, 180, 180),
+            thickness,
+            cv2.LINE_AA,
+        )
 
 
 def check_hand_quality(hand_landmarks):
@@ -1297,7 +1706,12 @@ def check_hand_quality(hand_landmarks):
 
     # 2. Edge check
     for x, y in zip(xs, ys):
-        if x < HAND_EDGE_MARGIN or x > (1.0 - HAND_EDGE_MARGIN) or y < HAND_EDGE_MARGIN or y > (1.0 - HAND_EDGE_MARGIN):
+        if (
+            x < HAND_EDGE_MARGIN
+            or x > (1.0 - HAND_EDGE_MARGIN)
+            or y < HAND_EDGE_MARGIN
+            or y > (1.0 - HAND_EDGE_MARGIN)
+        ):
             return False, "Hand Too Close to Edge"
 
     # 3. Size check
@@ -1322,7 +1736,9 @@ def calculate_hand_movement(current_landmarks, prev_landmarks_pts) -> float:
     """
     if current_landmarks is None or prev_landmarks_pts is None:
         return 0.0
-    curr_pts = np.array([[lm.x, lm.y] for lm in current_landmarks.landmark], dtype=np.float32)
+    curr_pts = np.array(
+        [[lm.x, lm.y] for lm in current_landmarks.landmark], dtype=np.float32
+    )
     prev_pts = np.array(prev_landmarks_pts, dtype=np.float32)
     if curr_pts.shape != prev_pts.shape:
         return 0.0
@@ -1339,8 +1755,13 @@ class AdaptiveLandmarkSmoother:
 
     Formula: smoothed = alpha * current + (1 - alpha) * previous
     """
-    def __init__(self, alpha_slow=EMA_ALPHA_SLOW, alpha_fast=EMA_ALPHA_FAST,
-                 speed_threshold=EMA_SPEED_THRESHOLD):
+
+    def __init__(
+        self,
+        alpha_slow=EMA_ALPHA_SLOW,
+        alpha_fast=EMA_ALPHA_FAST,
+        speed_threshold=EMA_SPEED_THRESHOLD,
+    ):
         self.alpha_slow = alpha_slow
         self.alpha_fast = alpha_fast
         self.speed_threshold = speed_threshold
@@ -1353,8 +1774,7 @@ class AdaptiveLandmarkSmoother:
         Returns the modified hand_landmarks object.
         """
         current = np.array(
-            [[lm.x, lm.y, lm.z] for lm in hand_landmarks.landmark],
-            dtype=np.float32
+            [[lm.x, lm.y, lm.z] for lm in hand_landmarks.landmark], dtype=np.float32
         )
 
         if self.prev_landmarks is None:
@@ -1363,14 +1783,19 @@ class AdaptiveLandmarkSmoother:
             return hand_landmarks
 
         # Compute per-landmark speed (average 2D displacement)
-        speed = float(np.mean(np.linalg.norm(
-            current[:, :2] - self.prev_landmarks[:, :2], axis=1
-        )))
+        speed = float(
+            np.mean(np.linalg.norm(current[:, :2] - self.prev_landmarks[:, :2], axis=1))
+        )
 
         # Adaptive alpha: fast motion → high alpha (responsive), slow → low alpha (smooth)
-        self.current_alpha = self.alpha_fast if speed > self.speed_threshold else self.alpha_slow
+        self.current_alpha = (
+            self.alpha_fast if speed > self.speed_threshold else self.alpha_slow
+        )
 
-        smoothed = self.current_alpha * current + (1.0 - self.current_alpha) * self.prev_landmarks
+        smoothed = (
+            self.current_alpha * current
+            + (1.0 - self.current_alpha) * self.prev_landmarks
+        )
         self.prev_landmarks = smoothed.copy()
 
         # Modify coordinates in place
@@ -1393,55 +1818,123 @@ def calculate_stability_score(stability_buffer, max_variance=STABILITY_MAX_VARIA
     """
     if len(stability_buffer) < 2:
         return 100  # Assume fully stable if we don't have enough frames yet
-    
+
     # stability_buffer contains arrays of shape (21, 2)
-    frames = np.array(list(stability_buffer), dtype=np.float32)  # Shape: (num_frames, 21, 2)
-    
+    frames = np.array(
+        list(stability_buffer), dtype=np.float32
+    )  # Shape: (num_frames, 21, 2)
+
     # Calculate the variance of each landmark over time (axis=0)
     # Then take the mean variance across all landmarks and dimensions (x, y)
     variance = float(np.mean(np.var(frames, axis=0)))
-    
+
     # Map variance to a 0–100 score: 0 variance = 100 score, max_variance = 0 score
     score = max(0, min(100, int(100 * (1.0 - variance / max_variance))))
     return score
 
 
-def draw_rounded_rect(img, pt1, pt2, color, radius=18, thickness=-1, alpha=0.7, border_color=None, border_thickness=1, accent_color=None):
+def draw_rounded_rect(
+    img,
+    pt1,
+    pt2,
+    color,
+    radius=18,
+    thickness=-1,
+    alpha=0.7,
+    border_color=None,
+    border_thickness=1,
+    accent_color=None,
+):
     """
     Draw a filled rounded rectangle with transparency, anti-aliased borders, and a left accent line.
     """
     overlay = img.copy()
     x1, y1 = pt1
     x2, y2 = pt2
-    
+
     # Ensure radius is non-negative and doesn't exceed dimensions
     radius = max(0, min(radius, abs(x2 - x1) // 2, abs(y2 - y1) // 2))
-    
+
     # Draw body
     cv2.rectangle(overlay, (x1 + radius, y1), (x2 - radius, y2), color, thickness)
     cv2.rectangle(overlay, (x1, y1 + radius), (x2, y2 - radius), color, thickness)
-    
+
     # Draw corners
-    for c in [(x1 + radius, y1 + radius, 180), (x2 - radius, y1 + radius, 270),
-              (x1 + radius, y2 - radius, 90), (x2 - radius, y2 - radius, 0)]:
-        cv2.ellipse(overlay, (c[0], c[1]), (radius, radius), c[2], 0, 90, color, thickness)
-        
+    for c in [
+        (x1 + radius, y1 + radius, 180),
+        (x2 - radius, y1 + radius, 270),
+        (x1 + radius, y2 - radius, 90),
+        (x2 - radius, y2 - radius, 0),
+    ]:
+        cv2.ellipse(
+            overlay, (c[0], c[1]), (radius, radius), c[2], 0, 90, color, thickness
+        )
+
     cv2.addWeighted(overlay, alpha, img, 1.0 - alpha, 0, img)
-    
+
     # Draw border
     if border_color is not None:
-        cv2.line(img, (x1 + radius, y1), (x2 - radius, y1), border_color, border_thickness, cv2.LINE_AA)
-        cv2.line(img, (x1 + radius, y2), (x2 - radius, y2), border_color, border_thickness, cv2.LINE_AA)
-        cv2.line(img, (x1, y1 + radius), (x1, y2 - radius), border_color, border_thickness, cv2.LINE_AA)
-        cv2.line(img, (x2, y2 - radius), (x2, y1 + radius), border_color, border_thickness, cv2.LINE_AA)
-        for c in [(x1 + radius, y1 + radius, 180), (x2 - radius, y1 + radius, 270),
-                  (x1 + radius, y2 - radius, 90), (x2 - radius, y2 - radius, 0)]:
-            cv2.ellipse(img, (c[0], c[1]), (radius, radius), c[2], 0, 90, border_color, border_thickness, cv2.LINE_AA)
-            
+        cv2.line(
+            img,
+            (x1 + radius, y1),
+            (x2 - radius, y1),
+            border_color,
+            border_thickness,
+            cv2.LINE_AA,
+        )
+        cv2.line(
+            img,
+            (x1 + radius, y2),
+            (x2 - radius, y2),
+            border_color,
+            border_thickness,
+            cv2.LINE_AA,
+        )
+        cv2.line(
+            img,
+            (x1, y1 + radius),
+            (x1, y2 - radius),
+            border_color,
+            border_thickness,
+            cv2.LINE_AA,
+        )
+        cv2.line(
+            img,
+            (x2, y2 - radius),
+            (x2, y1 + radius),
+            border_color,
+            border_thickness,
+            cv2.LINE_AA,
+        )
+        for c in [
+            (x1 + radius, y1 + radius, 180),
+            (x2 - radius, y1 + radius, 270),
+            (x1 + radius, y2 - radius, 90),
+            (x2 - radius, y2 - radius, 0),
+        ]:
+            cv2.ellipse(
+                img,
+                (c[0], c[1]),
+                (radius, radius),
+                c[2],
+                0,
+                90,
+                border_color,
+                border_thickness,
+                cv2.LINE_AA,
+            )
+
     # Draw accent stripe
     if accent_color is not None:
         stripe_offset = 6
-        cv2.line(img, (x1 + stripe_offset, y1 + radius), (x1 + stripe_offset, y2 - radius), accent_color, 3, cv2.LINE_AA)
+        cv2.line(
+            img,
+            (x1 + stripe_offset, y1 + radius),
+            (x1 + stripe_offset, y2 - radius),
+            accent_color,
+            3,
+            cv2.LINE_AA,
+        )
 
 
 def draw_confidence_bar(img, x, y, w, h, confidence, color):
@@ -1451,14 +1944,21 @@ def draw_confidence_bar(img, x, y, w, h, confidence, color):
     radius = h // 2
     p1 = (x + radius, y + radius)
     p2 = (x + w - radius, y + radius)
-    
+
     # Background line
     cv2.line(img, p1, p2, (40, 40, 50), h, cv2.LINE_AA)
-    
+
     # Foreground line
     fill_w = int(w * confidence)
     if fill_w >= h:
-        cv2.line(img, p1, (x + radius + int((w - 2 * radius) * confidence), y + radius), color, h - 2, cv2.LINE_AA)
+        cv2.line(
+            img,
+            p1,
+            (x + radius + int((w - 2 * radius) * confidence), y + radius),
+            color,
+            h - 2,
+            cv2.LINE_AA,
+        )
     elif fill_w > 0:
         cv2.circle(img, p1, radius - 1, color, -1, cv2.LINE_AA)
 
@@ -1470,21 +1970,40 @@ def draw_hold_progress_bar(img, x, y, w, h, progress, color):
     radius = h // 2
     p1 = (x + radius, y + radius)
     p2 = (x + w - radius, y + radius)
-    
+
     # Background line
     cv2.line(img, p1, p2, (30, 30, 40), h, cv2.LINE_AA)
-    
+
     # Foreground line
     fill_w = int(w * min(progress, 1.0))
     if fill_w >= h:
-        cv2.line(img, p1, (x + radius + int((w - 2 * radius) * progress), y + radius), color, h - 2, cv2.LINE_AA)
+        cv2.line(
+            img,
+            p1,
+            (x + radius + int((w - 2 * radius) * progress), y + radius),
+            color,
+            h - 2,
+            cv2.LINE_AA,
+        )
     elif fill_w > 0:
         cv2.circle(img, p1, radius - 1, color, -1, cv2.LINE_AA)
 
 
-def draw_hud(frame, prediction, confidence, probabilities, label_names,
-             word_buffer, sentence_buffer, fps, hand_detected, state,
-             speech_status, selected_language="English", translated_text=""):
+def draw_hud(
+    frame,
+    prediction,
+    confidence,
+    probabilities,
+    label_names,
+    word_buffer,
+    sentence_buffer,
+    fps,
+    hand_detected,
+    state,
+    speech_status,
+    selected_language="English",
+    translated_text="",
+):
     """
     Draw a polished heads-up display overlay.
 
@@ -1505,7 +2024,7 @@ def draw_hud(frame, prediction, confidence, probabilities, label_names,
         translated_text: Tamil translation of the sentence buffer (Tamil mode only).
     """
     h, w = frame.shape[:2]
-    
+
     # Dynamic HUD scaling factor based on resolution width
     u_scale = 1.0 if w >= 1000 else 0.75
     margin = int(15 * u_scale)
@@ -1514,17 +2033,41 @@ def draw_hud(frame, prediction, confidence, probabilities, label_names,
     # ── Top-left: Title bar ─────────────────────────────────────────────────
     title_w = int(520 * u_scale)
     title_h = int(50 * u_scale)
-    draw_rounded_rect(frame, (margin, margin), (margin + title_w, margin + title_h),
-                      BG_DARK, radius=12, alpha=0.85, border_color=BORDER_COLOR,
-                      border_thickness=border_thickness, accent_color=ACCENT_COLOR)
-    
-    cv2.putText(frame, "VISION-SPEAK ASL", (margin + int(20 * u_scale), margin + int(33 * u_scale)),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.65 * u_scale, TEAL, max(1, int(2 * u_scale)), cv2.LINE_AA)
+    draw_rounded_rect(
+        frame,
+        (margin, margin),
+        (margin + title_w, margin + title_h),
+        BG_DARK,
+        radius=12,
+        alpha=0.85,
+        border_color=BORDER_COLOR,
+        border_thickness=border_thickness,
+        accent_color=ACCENT_COLOR,
+    )
+
+    cv2.putText(
+        frame,
+        "VISION-SPEAK ASL",
+        (margin + int(20 * u_scale), margin + int(33 * u_scale)),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.65 * u_scale,
+        TEAL,
+        max(1, int(2 * u_scale)),
+        cv2.LINE_AA,
+    )
 
     # Language indicator
     lang_color = TEAL if selected_language == "English" else ORANGE
-    cv2.putText(frame, f"Lang: {selected_language}", (margin + int(240 * u_scale), margin + int(32 * u_scale)),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.48 * u_scale, lang_color, max(1, int(1 * u_scale)), cv2.LINE_AA)
+    cv2.putText(
+        frame,
+        f"Lang: {selected_language}",
+        (margin + int(240 * u_scale), margin + int(32 * u_scale)),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.48 * u_scale,
+        lang_color,
+        max(1, int(1 * u_scale)),
+        cv2.LINE_AA,
+    )
 
     # Speech status indicator
     if speech_status == SpeechEngine.STATUS_SPEAKING:
@@ -1536,25 +2079,57 @@ def draw_hud(frame, prediction, confidence, probabilities, label_names,
     else:
         status_color = GRAY
         status_icon = "TTS READY"
-    cv2.putText(frame, status_icon, (margin + int(390 * u_scale), margin + int(32 * u_scale)),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.42 * u_scale, status_color, max(1, int(1 * u_scale)), cv2.LINE_AA)
+    cv2.putText(
+        frame,
+        status_icon,
+        (margin + int(390 * u_scale), margin + int(32 * u_scale)),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.42 * u_scale,
+        status_color,
+        max(1, int(1 * u_scale)),
+        cv2.LINE_AA,
+    )
 
     # ── Mid-left: Debug Diagnostics Panel ──────────────────────────────────
     debug_x = margin
     debug_y = margin + title_h + int(12 * u_scale)
     debug_w = int(240 * u_scale)
     debug_h = int(220 * u_scale)
-    draw_rounded_rect(frame, (debug_x, debug_y), (debug_x + debug_w, debug_y + debug_h),
-                      BG_DARK, radius=12, alpha=0.85, border_color=BORDER_COLOR,
-                      border_thickness=border_thickness, accent_color=PURPLE)
-    
-    cv2.putText(frame, "SYSTEM DIAGNOSTICS", (debug_x + int(15 * u_scale), debug_y + int(24 * u_scale)),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.45 * u_scale, PURPLE, max(1, int(1 * u_scale)), cv2.LINE_AA)
+    draw_rounded_rect(
+        frame,
+        (debug_x, debug_y),
+        (debug_x + debug_w, debug_y + debug_h),
+        BG_DARK,
+        radius=12,
+        alpha=0.85,
+        border_color=BORDER_COLOR,
+        border_thickness=border_thickness,
+        accent_color=PURPLE,
+    )
+
+    cv2.putText(
+        frame,
+        "SYSTEM DIAGNOSTICS",
+        (debug_x + int(15 * u_scale), debug_y + int(24 * u_scale)),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.45 * u_scale,
+        PURPLE,
+        max(1, int(1 * u_scale)),
+        cv2.LINE_AA,
+    )
 
     y_off = debug_y + int(52 * u_scale)
     # Render FPS
-    cv2.putText(frame, f"FPS: {fps:.1f}", (debug_x + int(15 * u_scale), y_off),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.45 * u_scale, WHITE, max(1, int(1 * u_scale)), cv2.LINE_AA)
+    cv2.putText(
+        frame,
+        f"FPS: {fps:.1f}",
+        (debug_x + int(15 * u_scale), y_off),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.45 * u_scale,
+        WHITE,
+        max(1, int(1 * u_scale)),
+        cv2.LINE_AA,
+    )
 
     # Render Tracking Status
     tracking_status = state.get("tracking_status", "LOST")
@@ -1567,48 +2142,144 @@ def draw_hud(frame, prediction, confidence, probabilities, label_names,
     else:
         track_color = RED
         track_label = "[○ LOST]"
-    cv2.putText(frame, f"Track: {track_label}", (debug_x + int(15 * u_scale), y_off + int(24 * u_scale)),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.45 * u_scale, track_color, max(1, int(1 * u_scale)), cv2.LINE_AA)
+    cv2.putText(
+        frame,
+        f"Track: {track_label}",
+        (debug_x + int(15 * u_scale), y_off + int(24 * u_scale)),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.45 * u_scale,
+        track_color,
+        max(1, int(1 * u_scale)),
+        cv2.LINE_AA,
+    )
 
     # Render Prediction Confidence
-    cv2.putText(frame, f"Conf: {confidence * 100:.1f}%", (debug_x + int(15 * u_scale), y_off + int(48 * u_scale)),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.45 * u_scale, WHITE, max(1, int(1 * u_scale)), cv2.LINE_AA)
+    cv2.putText(
+        frame,
+        f"Conf: {confidence * 100:.1f}%",
+        (debug_x + int(15 * u_scale), y_off + int(48 * u_scale)),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.45 * u_scale,
+        WHITE,
+        max(1, int(1 * u_scale)),
+        cv2.LINE_AA,
+    )
 
     # Render Emotion Status
     emotion_str = state.get("current_emotion", "Neutral")
     emotion_conf = state.get("emotion_confidence", 0.0)
-    cv2.putText(frame, f"Emotion: {emotion_str} ({emotion_conf*100:.0f}%)", (debug_x + int(15 * u_scale), y_off + int(72 * u_scale)),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.42 * u_scale, WHITE, max(1, int(1 * u_scale)), cv2.LINE_AA)
+    cv2.putText(
+        frame,
+        f"Emotion: {emotion_str} ({emotion_conf * 100:.0f}%)",
+        (debug_x + int(15 * u_scale), y_off + int(72 * u_scale)),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.42 * u_scale,
+        WHITE,
+        max(1, int(1 * u_scale)),
+        cv2.LINE_AA,
+    )
 
     # Render Stability Score
     stability_score = state.get("stability_score", 100)
-    cv2.putText(frame, f"Stability: {stability_score}/100", (debug_x + int(15 * u_scale), y_off + int(96 * u_scale)),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.45 * u_scale, WHITE, max(1, int(1 * u_scale)), cv2.LINE_AA)
+    cv2.putText(
+        frame,
+        f"Stability: {stability_score}/100",
+        (debug_x + int(15 * u_scale), y_off + int(96 * u_scale)),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.45 * u_scale,
+        WHITE,
+        max(1, int(1 * u_scale)),
+        cv2.LINE_AA,
+    )
 
     # Render Process Time (frame processing latency)
     process_time_ms = state.get("process_time_ms", 0.0)
     avg_process_time_ms = state.get("avg_process_time_ms", 0.0)
-    pt_color = GREEN if process_time_ms < 50 else (YELLOW if process_time_ms < 80 else RED)
-    cv2.putText(frame, f"Latency: {process_time_ms:.1f}ms", (debug_x + int(15 * u_scale), y_off + int(120 * u_scale)),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.45 * u_scale, pt_color, max(1, int(1 * u_scale)), cv2.LINE_AA)
-    cv2.putText(frame, f"Avg: {avg_process_time_ms:.1f}ms", (debug_x + int(130 * u_scale), y_off + int(120 * u_scale)),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.38 * u_scale, GRAY, max(1, int(1 * u_scale)), cv2.LINE_AA)
+    pt_color = (
+        GREEN if process_time_ms < 50 else (YELLOW if process_time_ms < 80 else RED)
+    )
+    cv2.putText(
+        frame,
+        f"Latency: {process_time_ms:.1f}ms",
+        (debug_x + int(15 * u_scale), y_off + int(120 * u_scale)),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.45 * u_scale,
+        pt_color,
+        max(1, int(1 * u_scale)),
+        cv2.LINE_AA,
+    )
+    cv2.putText(
+        frame,
+        f"Avg: {avg_process_time_ms:.1f}ms",
+        (debug_x + int(130 * u_scale), y_off + int(120 * u_scale)),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.38 * u_scale,
+        GRAY,
+        max(1, int(1 * u_scale)),
+        cv2.LINE_AA,
+    )
 
     # Render Smoother Alpha
     smoother_alpha = state.get("smoother_alpha", 0.0)
     alpha_color = TEAL if smoother_alpha >= 0.7 else YELLOW
-    cv2.putText(frame, f"EMA Alpha: {smoother_alpha:.2f}", (debug_x + int(15 * u_scale), y_off + int(144 * u_scale)),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.45 * u_scale, alpha_color, max(1, int(1 * u_scale)), cv2.LINE_AA)
+    cv2.putText(
+        frame,
+        f"EMA Alpha: {smoother_alpha:.2f}",
+        (debug_x + int(15 * u_scale), y_off + int(144 * u_scale)),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.45 * u_scale,
+        alpha_color,
+        max(1, int(1 * u_scale)),
+        cv2.LINE_AA,
+    )
+
+    # ── PHASE 10: Collision Debug Panel ─────────────────────────────────────
+    col_debug = state.get("collision_debug", {})
+    second_best = col_debug.get("second_best", "")
+    second_conf = col_debug.get("second_conf", 0.0)
+    collision_risk = col_debug.get("collision_risk", 1.0)
+    auto_corrected = col_debug.get("auto_corrected", False)
+    rule_used = col_debug.get("rule_used", "")
+
+    risk_str = f"Alt: {second_best} ({second_conf * 100:.0f}%)"
+    risk_color = ORANGE if collision_risk < 0.15 else (YELLOW if collision_risk < 0.3 else GREEN)
+
+    cv2.putText(
+        frame, risk_str,
+        (debug_x + int(15 * u_scale), y_off + int(168 * u_scale)),
+        cv2.FONT_HERSHEY_SIMPLEX, 0.42 * u_scale, risk_color,
+        max(1, int(1 * u_scale)), cv2.LINE_AA,
+    )
+    cv2.putText(
+        frame, f"Risk: {collision_risk:.3f}",
+        (debug_x + int(15 * u_scale), y_off + int(188 * u_scale)),
+        cv2.FONT_HERSHEY_SIMPLEX, 0.42 * u_scale, risk_color,
+        max(1, int(1 * u_scale)), cv2.LINE_AA,
+    )
+    if auto_corrected:
+        cv2.putText(
+            frame, f"CORRECTED ({rule_used})",
+            (debug_x + int(15 * u_scale), y_off + int(208 * u_scale)),
+            cv2.FONT_HERSHEY_SIMPLEX, 0.42 * u_scale, ORANGE,
+            max(1, int(2 * u_scale)), cv2.LINE_AA,
+        )
 
     # ── Main prediction panel (right side) ──────────────────────────────────
     panel_w = int(280 * u_scale)
     panel_h = int(370 * u_scale)
     panel_x = w - panel_w - margin
     panel_y = margin
-    draw_rounded_rect(frame, (panel_x, panel_y),
-                      (panel_x + panel_w, panel_y + panel_h),
-                      BG_DARK, radius=14, alpha=0.85, border_color=BORDER_COLOR,
-                      border_thickness=border_thickness, accent_color=TEAL)
+    draw_rounded_rect(
+        frame,
+        (panel_x, panel_y),
+        (panel_x + panel_w, panel_y + panel_h),
+        BG_DARK,
+        radius=14,
+        alpha=0.85,
+        border_color=BORDER_COLOR,
+        border_thickness=border_thickness,
+        accent_color=TEAL,
+    )
 
     if hand_detected:
         status = state.get("hand_status", "OK")
@@ -1616,56 +2287,123 @@ def draw_hud(frame, prediction, confidence, probabilities, label_names,
             # Display Status (e.g., "Hand Not Ready" or "Stabilizing Hand...")
             status_text = "Stabilizing Hand..." if status == "Hand Moving" else status
             status_color = YELLOW if status == "Hand Moving" else RED
-            status_size = cv2.getTextSize(status_text, cv2.FONT_HERSHEY_SIMPLEX, 0.65 * u_scale, max(1, int(2 * u_scale)))[0]
+            status_size = cv2.getTextSize(
+                status_text,
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.65 * u_scale,
+                max(1, int(2 * u_scale)),
+            )[0]
             status_x = panel_x + (panel_w - status_size[0]) // 2
-            cv2.putText(frame, status_text, (status_x, panel_y + int(120 * u_scale)),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.65 * u_scale, status_color, max(1, int(2 * u_scale)), cv2.LINE_AA)
+            cv2.putText(
+                frame,
+                status_text,
+                (status_x, panel_y + int(120 * u_scale)),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.65 * u_scale,
+                status_color,
+                max(1, int(2 * u_scale)),
+                cv2.LINE_AA,
+            )
 
             detail = state.get("hand_status_detail", "")
             if detail:
-                detail_size = cv2.getTextSize(detail, cv2.FONT_HERSHEY_SIMPLEX, 0.45 * u_scale, max(1, int(1 * u_scale)))[0]
+                detail_size = cv2.getTextSize(
+                    detail,
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    0.45 * u_scale,
+                    max(1, int(1 * u_scale)),
+                )[0]
                 detail_x = panel_x + (panel_w - detail_size[0]) // 2
-                cv2.putText(frame, detail, (detail_x, panel_y + int(160 * u_scale)),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.45 * u_scale, GRAY, max(1, int(1 * u_scale)), cv2.LINE_AA)
+                cv2.putText(
+                    frame,
+                    detail,
+                    (detail_x, panel_y + int(160 * u_scale)),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    0.45 * u_scale,
+                    GRAY,
+                    max(1, int(1 * u_scale)),
+                    cv2.LINE_AA,
+                )
         elif prediction:
             # Determine prediction display (show raw prediction even if low confidence, but draw in RED)
             display_pred = prediction if prediction else ""
             thresh = 0.95 if len(display_pred) > 1 else CONFIDENCE_THRESHOLD
-            is_confident = (confidence >= thresh)
-            
+            is_confident = confidence >= thresh
+
             # Prediction letter — large (dynamically scale font size to prevent overflow for phrases)
             pred_color = TEAL if is_confident else RED
-            
+
             font_scale = 3.0 * u_scale if len(display_pred) <= 1 else 0.8 * u_scale
             max_text_w = panel_w - int(30 * u_scale)
             while font_scale > 0.3:
-                letter_size = cv2.getTextSize(display_pred, cv2.FONT_HERSHEY_SIMPLEX, font_scale, max(1, int(font_scale * 1.5)))[0]
+                letter_size = cv2.getTextSize(
+                    display_pred,
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    font_scale,
+                    max(1, int(font_scale * 1.5)),
+                )[0]
                 if letter_size[0] <= max_text_w:
                     break
                 font_scale -= 0.05
-                
+
             letter_x = panel_x + (panel_w - letter_size[0]) // 2
-            cv2.putText(frame, display_pred, (letter_x, panel_y + int(100 * u_scale)),
-                        cv2.FONT_HERSHEY_SIMPLEX, font_scale, pred_color, max(1, int(font_scale * 1.5)), cv2.LINE_AA)
+            cv2.putText(
+                frame,
+                display_pred,
+                (letter_x, panel_y + int(100 * u_scale)),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                font_scale,
+                pred_color,
+                max(1, int(font_scale * 1.5)),
+                cv2.LINE_AA,
+            )
 
             # Confidence percentage
             conf_text = f"{confidence * 100:.1f}%"
             conf_color = GREEN if is_confident else RED
-            conf_size = cv2.getTextSize(conf_text, cv2.FONT_HERSHEY_SIMPLEX, 0.75 * u_scale, max(1, int(2 * u_scale)))[0]
+            conf_size = cv2.getTextSize(
+                conf_text,
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.75 * u_scale,
+                max(1, int(2 * u_scale)),
+            )[0]
             conf_x = panel_x + (panel_w - conf_size[0]) // 2
-            cv2.putText(frame, conf_text, (conf_x, panel_y + int(140 * u_scale)),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.75 * u_scale, conf_color, max(1, int(2 * u_scale)), cv2.LINE_AA)
+            cv2.putText(
+                frame,
+                conf_text,
+                (conf_x, panel_y + int(140 * u_scale)),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.75 * u_scale,
+                conf_color,
+                max(1, int(2 * u_scale)),
+                cv2.LINE_AA,
+            )
 
             # Confidence bar
-            draw_confidence_bar(frame, panel_x + int(20 * u_scale), panel_y + int(155 * u_scale),
-                                panel_w - int(40 * u_scale), int(14 * u_scale), confidence, conf_color)
+            draw_confidence_bar(
+                frame,
+                panel_x + int(20 * u_scale),
+                panel_y + int(155 * u_scale),
+                panel_w - int(40 * u_scale),
+                int(14 * u_scale),
+                confidence,
+                conf_color,
+            )
 
             # ── Hold-time progress (temporal feedback) ──────────────────────────
             y_hold = panel_y + int(195 * u_scale)
             if prediction in ("G", "H") and state.get("finger_count", -1) != -1:
                 f_count = state["finger_count"]
-                cv2.putText(frame, f"Finger Count: {f_count}", (panel_x + int(15 * u_scale), y_hold),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.48 * u_scale, YELLOW, max(1, int(1 * u_scale)), cv2.LINE_AA)
+                cv2.putText(
+                    frame,
+                    f"Finger Count: {f_count}",
+                    (panel_x + int(15 * u_scale), y_hold),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    0.48 * u_scale,
+                    YELLOW,
+                    max(1, int(1 * u_scale)),
+                    cv2.LINE_AA,
+                )
                 y_hold += int(25 * u_scale)
 
             if state["is_holding"]:
@@ -1673,20 +2411,49 @@ def draw_hud(frame, prediction, confidence, probabilities, label_names,
                 progress = elapsed / HOLD_TIME_REQUIRED
                 hold_text = f"Hold: {elapsed:.1f} / {HOLD_TIME_REQUIRED:.1f}s"
                 bar_color = GREEN if progress > 0.8 else ORANGE
-                cv2.putText(frame, hold_text, (panel_x + int(15 * u_scale), y_hold),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.48 * u_scale, YELLOW, max(1, int(1 * u_scale)), cv2.LINE_AA)
-                draw_hold_progress_bar(frame, panel_x + int(20 * u_scale), y_hold + int(8 * u_scale),
-                                       panel_w - int(40 * u_scale), int(12 * u_scale), progress, bar_color)
+                cv2.putText(
+                    frame,
+                    hold_text,
+                    (panel_x + int(15 * u_scale), y_hold),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    0.48 * u_scale,
+                    YELLOW,
+                    max(1, int(1 * u_scale)),
+                    cv2.LINE_AA,
+                )
+                draw_hold_progress_bar(
+                    frame,
+                    panel_x + int(20 * u_scale),
+                    y_hold + int(8 * u_scale),
+                    panel_w - int(40 * u_scale),
+                    int(12 * u_scale),
+                    progress,
+                    bar_color,
+                )
                 y_hold += int(35 * u_scale)
             elif state["locked_until_reset"]:
-                cv2.putText(frame, "Locked (change sign/remove hand)",
-                            (panel_x + int(12 * u_scale), y_hold),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.38 * u_scale, GRAY, max(1, int(1 * u_scale)), cv2.LINE_AA)
+                cv2.putText(
+                    frame,
+                    "Locked (change sign/remove hand)",
+                    (panel_x + int(12 * u_scale), y_hold),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    0.38 * u_scale,
+                    GRAY,
+                    max(1, int(1 * u_scale)),
+                    cv2.LINE_AA,
+                )
                 y_hold += int(25 * u_scale)
             elif not is_confident:
-                cv2.putText(frame, f"Low confidence (<{CONFIDENCE_THRESHOLD*100:.0f}%)",
-                            (panel_x + int(12 * u_scale), y_hold),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.40 * u_scale, RED, max(1, int(1 * u_scale)), cv2.LINE_AA)
+                cv2.putText(
+                    frame,
+                    f"Low confidence (<{CONFIDENCE_THRESHOLD * 100:.0f}%)",
+                    (panel_x + int(12 * u_scale), y_hold),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    0.40 * u_scale,
+                    RED,
+                    max(1, int(1 * u_scale)),
+                    cv2.LINE_AA,
+                )
                 y_hold += int(25 * u_scale)
             else:
                 y_hold += int(10 * u_scale)
@@ -1694,105 +2461,266 @@ def draw_hud(frame, prediction, confidence, probabilities, label_names,
             # ── Top-3 predictions ───────────────────────────────────────────────
             top_indices = np.argsort(probabilities)[::-1][:3]
             y_offset = y_hold + int(12 * u_scale)
-            cv2.putText(frame, "Top Predictions:", (panel_x + int(15 * u_scale), y_offset),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.45 * u_scale, GRAY, max(1, int(1 * u_scale)), cv2.LINE_AA)
+            cv2.putText(
+                frame,
+                "Top Predictions:",
+                (panel_x + int(15 * u_scale), y_offset),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.45 * u_scale,
+                GRAY,
+                max(1, int(1 * u_scale)),
+                cv2.LINE_AA,
+            )
             y_offset += int(28 * u_scale)
             for rank, idx in enumerate(top_indices, 1):
                 lbl = label_names[idx]
                 prob = probabilities[idx]
                 bar_color = TEAL if rank == 1 else TEAL_LIGHT
                 text = f"{rank}. {lbl}"
-                cv2.putText(frame, text, (panel_x + int(15 * u_scale), y_offset),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.5 * u_scale, WHITE, max(1, int(1 * u_scale)), cv2.LINE_AA)
-                draw_confidence_bar(frame, panel_x + int(60 * u_scale), y_offset - int(10 * u_scale),
-                                    panel_w - int(90 * u_scale), int(10 * u_scale), prob, bar_color)
+                cv2.putText(
+                    frame,
+                    text,
+                    (panel_x + int(15 * u_scale), y_offset),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    0.5 * u_scale,
+                    WHITE,
+                    max(1, int(1 * u_scale)),
+                    cv2.LINE_AA,
+                )
+                draw_confidence_bar(
+                    frame,
+                    panel_x + int(60 * u_scale),
+                    y_offset - int(10 * u_scale),
+                    panel_w - int(90 * u_scale),
+                    int(10 * u_scale),
+                    prob,
+                    bar_color,
+                )
                 pct = f"{prob * 100:.1f}%"
-                cv2.putText(frame, pct, (panel_x + panel_w - int(55 * u_scale), y_offset),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.38 * u_scale, GRAY, max(1, int(1 * u_scale)), cv2.LINE_AA)
+                cv2.putText(
+                    frame,
+                    pct,
+                    (panel_x + panel_w - int(55 * u_scale), y_offset),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    0.38 * u_scale,
+                    GRAY,
+                    max(1, int(1 * u_scale)),
+                    cv2.LINE_AA,
+                )
                 y_offset += int(28 * u_scale)
     else:
         # No hand detected
         msg = "No Hand Detected"
-        msg_size = cv2.getTextSize(msg, cv2.FONT_HERSHEY_SIMPLEX, 0.65 * u_scale, max(1, int(2 * u_scale)))[0]
+        msg_size = cv2.getTextSize(
+            msg, cv2.FONT_HERSHEY_SIMPLEX, 0.65 * u_scale, max(1, int(2 * u_scale))
+        )[0]
         msg_x = panel_x + (panel_w - msg_size[0]) // 2
-        cv2.putText(frame, msg, (msg_x, panel_y + int(120 * u_scale)),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.65 * u_scale, GRAY, max(1, int(2 * u_scale)), cv2.LINE_AA)
+        cv2.putText(
+            frame,
+            msg,
+            (msg_x, panel_y + int(120 * u_scale)),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.65 * u_scale,
+            GRAY,
+            max(1, int(2 * u_scale)),
+            cv2.LINE_AA,
+        )
 
         hint = "Show your hand"
-        hint_size = cv2.getTextSize(hint, cv2.FONT_HERSHEY_SIMPLEX, 0.45 * u_scale, max(1, int(1 * u_scale)))[0]
+        hint_size = cv2.getTextSize(
+            hint, cv2.FONT_HERSHEY_SIMPLEX, 0.45 * u_scale, max(1, int(1 * u_scale))
+        )[0]
         hint_x = panel_x + (panel_w - hint_size[0]) // 2
-        cv2.putText(frame, hint, (hint_x, panel_y + int(160 * u_scale)),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.45 * u_scale, GRAY, max(1, int(1 * u_scale)), cv2.LINE_AA)
+        cv2.putText(
+            frame,
+            hint,
+            (hint_x, panel_y + int(160 * u_scale)),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.45 * u_scale,
+            GRAY,
+            max(1, int(1 * u_scale)),
+            cv2.LINE_AA,
+        )
 
     # ── Emergency events daily counter (always visible at bottom of right panel) ──
     emergency_count = state.get("emergency_count_today", 0)
     counter_text = f"Emergency Events Today: {emergency_count}"
-    cv2.putText(frame, counter_text, (panel_x + int(15 * u_scale), panel_y + panel_h - int(15 * u_scale)),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.42 * u_scale, (80, 80, 255) if emergency_count > 0 else GRAY, max(1, int(1 * u_scale)), cv2.LINE_AA)
+    cv2.putText(
+        frame,
+        counter_text,
+        (panel_x + int(15 * u_scale), panel_y + panel_h - int(15 * u_scale)),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.42 * u_scale,
+        (80, 80, 255) if emergency_count > 0 else GRAY,
+        max(1, int(1 * u_scale)),
+        cv2.LINE_AA,
+    )
 
     # ── Feedback banner (e.g. "Added A") ────────────────────────────────────
     if state["feedback_message"]:
         fb_text = state["feedback_message"]
-        fb_size = cv2.getTextSize(fb_text, cv2.FONT_HERSHEY_SIMPLEX, 0.8 * u_scale, max(1, int(2 * u_scale)))[0]
+        fb_size = cv2.getTextSize(
+            fb_text, cv2.FONT_HERSHEY_SIMPLEX, 0.8 * u_scale, max(1, int(2 * u_scale))
+        )[0]
         fb_x = (w - fb_size[0]) // 2
         fb_y = h // 2 - int(40 * u_scale)
-        draw_rounded_rect(frame, (fb_x - int(20 * u_scale), fb_y - int(35 * u_scale)),
-                          (fb_x + fb_size[0] + int(20 * u_scale), fb_y + int(15 * u_scale)),
-                          (20, 100, 20), radius=14, alpha=0.85)
-        cv2.putText(frame, fb_text, (fb_x, fb_y),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.8 * u_scale, GREEN, max(1, int(2 * u_scale)), cv2.LINE_AA)
+        draw_rounded_rect(
+            frame,
+            (fb_x - int(20 * u_scale), fb_y - int(35 * u_scale)),
+            (fb_x + fb_size[0] + int(20 * u_scale), fb_y + int(15 * u_scale)),
+            (20, 100, 20),
+            radius=14,
+            alpha=0.85,
+        )
+        cv2.putText(
+            frame,
+            fb_text,
+            (fb_x, fb_y),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.8 * u_scale,
+            GREEN,
+            max(1, int(2 * u_scale)),
+            cv2.LINE_AA,
+        )
 
     # ── Word buffer (bottom bar - base layer for layout calculation) ─────────
     bar_h = int(58 * u_scale)
     bar_y = h - bar_h - margin
-    draw_rounded_rect(frame, (margin, bar_y), (w - margin, bar_y + bar_h),
-                      BG_DARK, radius=12, alpha=0.85, border_color=BORDER_COLOR,
-                      border_thickness=border_thickness, accent_color=GRAY)
+    draw_rounded_rect(
+        frame,
+        (margin, bar_y),
+        (w - margin, bar_y + bar_h),
+        BG_DARK,
+        radius=12,
+        alpha=0.85,
+        border_color=BORDER_COLOR,
+        border_thickness=border_thickness,
+        accent_color=GRAY,
+    )
 
-    cv2.putText(frame, "Word:", (margin + int(15 * u_scale), bar_y + int(36 * u_scale)),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.55 * u_scale, GRAY, max(1, int(1 * u_scale)), cv2.LINE_AA)
+    cv2.putText(
+        frame,
+        "Word:",
+        (margin + int(15 * u_scale), bar_y + int(36 * u_scale)),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.55 * u_scale,
+        GRAY,
+        max(1, int(1 * u_scale)),
+        cv2.LINE_AA,
+    )
 
     word_text = "".join(word_buffer) if word_buffer else "_"
-    cv2.putText(frame, word_text, (margin + int(75 * u_scale), bar_y + int(38 * u_scale)),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.75 * u_scale, WHITE, max(1, int(2 * u_scale)), cv2.LINE_AA)
+    cv2.putText(
+        frame,
+        word_text,
+        (margin + int(75 * u_scale), bar_y + int(38 * u_scale)),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.75 * u_scale,
+        WHITE,
+        max(1, int(2 * u_scale)),
+        cv2.LINE_AA,
+    )
 
     # Controls hint (right-aligned dynamically)
     controls = "[Q]Quit [C]Clear [L]Lang [SPC]Word [BKSP]Del [ENTER]Speak"
-    controls_size = cv2.getTextSize(controls, cv2.FONT_HERSHEY_SIMPLEX, 0.38 * u_scale, max(1, int(1 * u_scale)))[0]
+    controls_size = cv2.getTextSize(
+        controls, cv2.FONT_HERSHEY_SIMPLEX, 0.38 * u_scale, max(1, int(1 * u_scale))
+    )[0]
     controls_x = w - margin - int(15 * u_scale) - controls_size[0]
-    cv2.putText(frame, controls, (controls_x, bar_y + int(36 * u_scale)),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.38 * u_scale, GRAY, max(1, int(1 * u_scale)), cv2.LINE_AA)
+    cv2.putText(
+        frame,
+        controls,
+        (controls_x, bar_y + int(36 * u_scale)),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.38 * u_scale,
+        GRAY,
+        max(1, int(1 * u_scale)),
+        cv2.LINE_AA,
+    )
 
     # ── Sentence buffer (second-from-bottom bar) ────────────────────────────
     sent_bar_h = int(48 * u_scale)
     sent_bar_y = bar_y - sent_bar_h - int(10 * u_scale)
-    draw_rounded_rect(frame, (margin, sent_bar_y), (w - margin, sent_bar_y + sent_bar_h),
-                      BG_DARK, radius=12, alpha=0.80, border_color=BORDER_COLOR,
-                      border_thickness=border_thickness, accent_color=PURPLE)
+    draw_rounded_rect(
+        frame,
+        (margin, sent_bar_y),
+        (w - margin, sent_bar_y + sent_bar_h),
+        BG_DARK,
+        radius=12,
+        alpha=0.80,
+        border_color=BORDER_COLOR,
+        border_thickness=border_thickness,
+        accent_color=PURPLE,
+    )
 
     # Label changes to "English:" in Tamil mode
     sent_label = "English:" if selected_language == "Tamil" else "Sentence:"
-    cv2.putText(frame, sent_label, (margin + int(15 * u_scale), sent_bar_y + int(30 * u_scale)),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.48 * u_scale, PURPLE, max(1, int(1 * u_scale)), cv2.LINE_AA)
+    cv2.putText(
+        frame,
+        sent_label,
+        (margin + int(15 * u_scale), sent_bar_y + int(30 * u_scale)),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.48 * u_scale,
+        PURPLE,
+        max(1, int(1 * u_scale)),
+        cv2.LINE_AA,
+    )
 
-    sentence_text = " ".join(sentence_buffer) if sentence_buffer else "(press SPACE to finish words)"
+    sentence_text = (
+        " ".join(sentence_buffer)
+        if sentence_buffer
+        else "(press SPACE to finish words)"
+    )
     sent_color = WHITE if sentence_buffer else GRAY
-    text_x_pos = margin + int(75 * u_scale) if selected_language == "Tamil" else margin + int(95 * u_scale)
-    cv2.putText(frame, sentence_text, (text_x_pos, sent_bar_y + int(30 * u_scale)),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.55 * u_scale, sent_color, max(1, int(1 * u_scale)), cv2.LINE_AA)
+    text_x_pos = (
+        margin + int(75 * u_scale)
+        if selected_language == "Tamil"
+        else margin + int(95 * u_scale)
+    )
+    cv2.putText(
+        frame,
+        sentence_text,
+        (text_x_pos, sent_bar_y + int(30 * u_scale)),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.55 * u_scale,
+        sent_color,
+        max(1, int(1 * u_scale)),
+        cv2.LINE_AA,
+    )
 
     # ── Tamil translation bar (only visible in Tamil mode) ──────────────────
     if selected_language == "Tamil" and translated_text:
         tamil_bar_h = int(40 * u_scale)
         tamil_bar_y = sent_bar_y - tamil_bar_h - int(8 * u_scale)
-        draw_rounded_rect(frame, (margin, tamil_bar_y), (w - margin, tamil_bar_y + tamil_bar_h),
-                          BG_DARK, radius=12, alpha=0.80, border_color=BORDER_COLOR,
-                          border_thickness=border_thickness, accent_color=ORANGE)
-        cv2.putText(frame, "Tamil:", (margin + int(15 * u_scale), tamil_bar_y + int(26 * u_scale)),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.48 * u_scale, ORANGE, max(1, int(1 * u_scale)), cv2.LINE_AA)
-        draw_unicode_text(frame, translated_text,
-                          (margin + int(75 * u_scale), tamil_bar_y + int(4 * u_scale)),
-                          ORANGE, font_size=int(26 * u_scale), thickness=max(1, int(1 * u_scale)))
+        draw_rounded_rect(
+            frame,
+            (margin, tamil_bar_y),
+            (w - margin, tamil_bar_y + tamil_bar_h),
+            BG_DARK,
+            radius=12,
+            alpha=0.80,
+            border_color=BORDER_COLOR,
+            border_thickness=border_thickness,
+            accent_color=ORANGE,
+        )
+        cv2.putText(
+            frame,
+            "Tamil:",
+            (margin + int(15 * u_scale), tamil_bar_y + int(26 * u_scale)),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.48 * u_scale,
+            ORANGE,
+            max(1, int(1 * u_scale)),
+            cv2.LINE_AA,
+        )
+        draw_unicode_text(
+            frame,
+            translated_text,
+            (margin + int(75 * u_scale), tamil_bar_y + int(4 * u_scale)),
+            ORANGE,
+            font_size=int(26 * u_scale),
+            thickness=max(1, int(1 * u_scale)),
+        )
 
     # ── Emergency Pop-up Modal (drawn on top of all elements) ──────────────────
     if state.get("emergency_active", False):
@@ -1801,46 +2729,113 @@ def draw_hud(frame, prediction, confidence, probabilities, label_names,
         emergency_language = state.get("emergency_language", "English")
         wa_status = state.get("whatsapp_status", "Not Opened")
         conf_val = state.get("emergency_confidence", 100.0)
-        
+
         alert_w = int(500 * u_scale)
         alert_h = int(240 * u_scale)
         x1 = (w - alert_w) // 2
         y1 = (h - alert_h) // 2
         x2 = x1 + alert_w
         y2 = y1 + alert_h
-        
+
         # Red background panel
-        draw_rounded_rect(frame, (x1, y1), (x2, y2), (50, 50, 255), radius=16, alpha=0.95,
-                          border_color=WHITE, border_thickness=max(1, int(2 * u_scale)))
-        
+        draw_rounded_rect(
+            frame,
+            (x1, y1),
+            (x2, y2),
+            (50, 50, 255),
+            radius=16,
+            alpha=0.95,
+            border_color=WHITE,
+            border_thickness=max(1, int(2 * u_scale)),
+        )
+
         # Indicator Circle (to simulate 🔴)
-        cv2.circle(frame, (x1 + int(35 * u_scale), y1 + int(40 * u_scale)), int(10 * u_scale), (0, 0, 255), -1)
-        cv2.circle(frame, (x1 + int(35 * u_scale), y1 + int(40 * u_scale)), int(12 * u_scale), WHITE, 1, cv2.LINE_AA)
-        
+        cv2.circle(
+            frame,
+            (x1 + int(35 * u_scale), y1 + int(40 * u_scale)),
+            int(10 * u_scale),
+            (0, 0, 255),
+            -1,
+        )
+        cv2.circle(
+            frame,
+            (x1 + int(35 * u_scale), y1 + int(40 * u_scale)),
+            int(12 * u_scale),
+            WHITE,
+            1,
+            cv2.LINE_AA,
+        )
+
         # Title text
-        cv2.putText(frame, "EMERGENCY DETECTED", (x1 + int(60 * u_scale), y1 + int(47 * u_scale)),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.75 * u_scale, WHITE, max(1, int(2 * u_scale)), cv2.LINE_AA)
-        
+        cv2.putText(
+            frame,
+            "EMERGENCY DETECTED",
+            (x1 + int(60 * u_scale), y1 + int(47 * u_scale)),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.75 * u_scale,
+            WHITE,
+            max(1, int(2 * u_scale)),
+            cv2.LINE_AA,
+        )
+
         # Details
-        cv2.putText(frame, f"Detected Keyword: {emergency_keyword}", (x1 + int(30 * u_scale), y1 + int(90 * u_scale)),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.55 * u_scale, YELLOW, max(1, int(2 * u_scale)), cv2.LINE_AA)
-        
-        cv2.putText(frame, f"Confidence Score: {conf_val:.1f}%", (x1 + int(30 * u_scale), y1 + int(125 * u_scale)),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.52 * u_scale, WHITE, max(1, int(1 * u_scale)), cv2.LINE_AA)
-        
+        cv2.putText(
+            frame,
+            f"Detected Keyword: {emergency_keyword}",
+            (x1 + int(30 * u_scale), y1 + int(90 * u_scale)),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.55 * u_scale,
+            YELLOW,
+            max(1, int(2 * u_scale)),
+            cv2.LINE_AA,
+        )
+
+        cv2.putText(
+            frame,
+            f"Confidence Score: {conf_val:.1f}%",
+            (x1 + int(30 * u_scale), y1 + int(125 * u_scale)),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.52 * u_scale,
+            WHITE,
+            max(1, int(1 * u_scale)),
+            cv2.LINE_AA,
+        )
+
         # ISO 8601 Format of emergency_time
         from datetime import datetime, timezone
+
         iso_time_str = datetime.fromtimestamp(emergency_time, timezone.utc).isoformat()
-        cv2.putText(frame, f"Time: {iso_time_str[:23]}Z", (x1 + int(30 * u_scale), y1 + int(160 * u_scale)),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.52 * u_scale, WHITE, max(1, int(1 * u_scale)), cv2.LINE_AA)
-        
+        cv2.putText(
+            frame,
+            f"Time: {iso_time_str[:23]}Z",
+            (x1 + int(30 * u_scale), y1 + int(160 * u_scale)),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.52 * u_scale,
+            WHITE,
+            max(1, int(1 * u_scale)),
+            cv2.LINE_AA,
+        )
+
         # WhatsApp status color
-        wa_color = GREEN if wa_status == "Success" else (RED if "Failed" in wa_status else YELLOW)
-        cv2.putText(frame, f"WhatsApp Alert: {wa_status}", (x1 + int(30 * u_scale), y1 + int(195 * u_scale)),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.52 * u_scale, wa_color, max(1, int(1.5 * u_scale)), cv2.LINE_AA)
+        wa_color = (
+            GREEN
+            if wa_status == "Success"
+            else (RED if "Failed" in wa_status else YELLOW)
+        )
+        cv2.putText(
+            frame,
+            f"WhatsApp Alert: {wa_status}",
+            (x1 + int(30 * u_scale), y1 + int(195 * u_scale)),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.52 * u_scale,
+            wa_color,
+            max(1, int(1.5 * u_scale)),
+            cv2.LINE_AA,
+        )
 
 
 # ── Temporal Logic Engine ───────────────────────────────────────────────────
+
 
 def get_majority_prediction(history, consistency_threshold):
     """
@@ -1866,7 +2861,22 @@ def get_majority_prediction(history, consistency_threshold):
 # Main Application Loop
 # ═══════════════════════════════════════════════════════════════════════════
 
+
 def main():
+    global current_user
+
+    # ── Startup User Information Form (replaces login/authentication) ─────────
+    print("\n" + "=" * 58)
+    print("  VisionSpeak - Sign Language Communication System")
+    print("  Please fill in your details to continue.")
+    print("=" * 58)
+    user_data = get_user_details()
+    if user_data is None:
+        print("\n[EXIT] Form closed. Exiting.")
+        sys.exit(0)
+    current_user = user_data
+    print(f"[OK] Welcome, {current_user['name']}! Starting VisionSpeak...")
+
     print("\n" + "=" * 58)
     print("  ASL Sign Language - Live Prediction + Text-to-Speech")
     print("  Bilingual: English / Tamil  [Press L to toggle]")
@@ -1876,9 +2886,6 @@ def main():
     model, le, scaler = load_model()
     label_names = le.classes_
 
-
-
-
     # ── Initialize TTS engine (singleton) ───────────────────────────────────
     tts = SpeechEngine()
 
@@ -1886,24 +2893,17 @@ def main():
     supabase = SupabaseManager()
     supabase.connect()
 
-    # ── Authentication Flow (Auto-Login or Login/Register GUI) ──────────────
-    import auth_gui
-    auth_result = auth_gui.run_auth_flow()
-    if not auth_result:
-        print("[AUTH] Authentication cancelled or closed. Exiting.")
-        sys.exit(0)
-        
-    auth_user_id = auth_result["user"].id
-    current_profile = auth_result["profile"]
-    print(f"[AUTH] Logged in user: {current_profile.get('name')}")
-
-    # Load user's preferred language from profile
-    selected_language = current_profile.get("preferred_language", "English")
+    # ── Use preferred language from startup form ──────────────────────────────
+    selected_language = current_user["preferred_language"]
     if selected_language not in ["English", "Tamil"]:
         selected_language = "English"
 
     # ── Initialize translation engine (bilingual support) ────────────────────
     translator = TranslationEngine(target_lang=selected_language)
+
+    # ── PHASE 5: Initialize Collision Rule Engine ────────────────────────────
+    rule_engine = CollisionRuleEngine()
+    print(f"[COLLISION] Rule engine active with {len(rule_engine.rules)} rules")
 
     # ── MediaPipe Hands ─────────────────────────────────────────────────────
     mp_hands = mp.solutions.hands
@@ -1939,32 +2939,29 @@ def main():
     tracking_status = "LOST"
 
     # ── State Variables (Temporal Logic) ────────────────────────────────────
-    word_buffer = deque(maxlen=50)       # Current word being built letter-by-letter
-    word_confidences = []                # Confidence values for characters in the current word
-    sentence_buffer = []                 # Accumulated words (list of strings)
-    sentence_confidences = []            # Confidence values for characters in the sentence
+    word_buffer = deque(maxlen=50)  # Current word being built letter-by-letter
+    word_confidences = []  # Confidence values for characters in the current word
+    sentence_buffer = []  # Accumulated words (list of strings)
+    sentence_confidences = []  # Confidence values for characters in the sentence
 
     # Per-frame prediction output
-    current_prediction = None            # Raw prediction from model this frame
-    confidence = 0.0                     # Raw confidence from model this frame
+    current_prediction = None  # Raw prediction from model this frame
+    confidence = 0.0  # Raw confidence from model this frame
     probabilities = np.zeros(len(label_names))
 
     # Prediction history for majority voting (last 20 frames)
     prediction_history = deque(maxlen=HISTORY_SIZE)
 
     # Hold timer: tracks when a stable prediction first appeared
-    hold_timer_start = None              # time.time() when hold began, None if not holding
+    hold_timer_start = None  # time.time() when hold began, None if not holding
 
     # Lock state: prevents re-adding the same letter
-    last_added_letter = None             # The last letter successfully committed
-    locked_until_reset = False           # True = waiting for hand removal or new sign
-
-
-
+    last_added_letter = None  # The last letter successfully committed
+    locked_until_reset = False  # True = waiting for hand removal or new sign
 
     # Feedback overlay
-    feedback_message = None              # e.g. "Added A"
-    feedback_timestamp = 0.0             # time.time() when feedback was set
+    feedback_message = None  # e.g. "Added A"
+    feedback_timestamp = 0.0  # time.time() when feedback was set
 
     # ── Emergency State Variables ───────────────────────────────────────────
     emergency_active = False
@@ -1972,11 +2969,13 @@ def main():
     emergency_trigger_time = 0.0
     emergency_language = "English"
     last_emergency_trigger_time = 0.0
-    emergency_cooldown_duration = 60.0  # 60 seconds duplicate protection (as per Success Criteria)
-    emergency_display_duration = 10.0   # Show alert popup for 10 seconds to read details
+    emergency_cooldown_duration = (
+        60.0  # 60 seconds duplicate protection (as per Success Criteria)
+    )
+    emergency_display_duration = 10.0  # Show alert popup for 10 seconds to read details
     whatsapp_status = "Not Triggered"
     emergency_confidence = 100.0
-    
+
     # Query today's emergency count on boot (cached value incremented locally)
     print("[DB] Fetching today's emergency events count...")
     emergency_count_today = get_emergency_count_today()
@@ -1995,8 +2994,8 @@ def main():
 
     print("[STATE] Temporal logic engine active:")
     print(f"        History window:   {HISTORY_SIZE} frames")
-    print(f"        Consistency:      >{CONSISTENCY_THRESHOLD*100:.0f}%")
-    print(f"        Confidence:       >={CONFIDENCE_THRESHOLD*100:.0f}%")
+    print(f"        Consistency:      >{CONSISTENCY_THRESHOLD * 100:.0f}%")
+    print(f"        Confidence:       >={CONFIDENCE_THRESHOLD * 100:.0f}%")
     print(f"        Hold time:        {HOLD_TIME_REQUIRED}s")
     print(f"        Auto-clear:       {AUTO_CLEAR}\n")
 
@@ -2008,7 +3007,7 @@ def main():
 
         frame = cv2.flip(frame, 1)  # mirror for natural interaction
         frame_start_time = time.time()  # Start frame processing timer
-        
+
         # Submit frame to emotion detector (Optimization 4)
         if emotion_detector.enabled:
             emotion_detector.detect(frame)
@@ -2019,7 +3018,18 @@ def main():
         hand_detected = False
         now = time.time()
         finger_count = -1
-        
+
+        # ── PHASE 10: Collision debug default state ─────────────────────
+        collision_debug = {
+            "prediction": None,
+            "confidence": 0.0,
+            "second_best": None,
+            "second_conf": 0.0,
+            "collision_risk": 1.0,
+            "auto_corrected": False,
+            "rule_used": None,
+        }
+
         # Reset prediction display arrays to Alphabet model defaults
         label_names = le.classes_
         probabilities = np.zeros(len(label_names))
@@ -2029,7 +3039,10 @@ def main():
             feedback_message = None
 
         # ── Expire emergency alert after emergency_display_duration ──────
-        if emergency_active and (now - emergency_trigger_time) > emergency_display_duration:
+        if (
+            emergency_active
+            and (now - emergency_trigger_time) > emergency_display_duration
+        ):
             emergency_active = False
 
         # ── Auto-clear sentence buffer after speech completes ────────────
@@ -2048,19 +3061,24 @@ def main():
             hand_lm = results.multi_hand_landmarks[0]
             hand_missing_frames = 0
             hand_detected = True
-            
+
             # 1. Adaptive EMA Landmark Smoothing (motion-adaptive alpha)
             hand_lm = landmark_smoother.smooth(hand_lm)
-            
+
             # Cache the smoothed landmarks object for grace period
             last_valid_hand_lm = hand_lm
             tracking_status = "ACTIVE"
-            
+
             # Append 2D coordinates to stability buffer (Optimization 9)
-            stability_buffer.append(np.array([[lm.x, lm.y] for lm in hand_lm.landmark], dtype=np.float32))
+            stability_buffer.append(
+                np.array([[lm.x, lm.y] for lm in hand_lm.landmark], dtype=np.float32)
+            )
         else:
             # Hysteresis grace period check (Optimization 3)
-            if last_valid_hand_lm is not None and hand_missing_frames < HAND_MISSING_GRACE_FRAMES:
+            if (
+                last_valid_hand_lm is not None
+                and hand_missing_frames < HAND_MISSING_GRACE_FRAMES
+            ):
                 hand_missing_frames += 1
                 hand_detected = True
                 hand_lm = last_valid_hand_lm
@@ -2081,14 +3099,16 @@ def main():
         if hand_detected and hand_lm is not None:
             # Draw smoothed hand landmarks
             mp_draw.draw_landmarks(
-                frame, hand_lm, mp_hands.HAND_CONNECTIONS,
+                frame,
+                hand_lm,
+                mp_hands.HAND_CONNECTIONS,
                 mp_styles.get_default_hand_landmarks_style(),
                 mp_styles.get_default_hand_connections_style(),
             )
 
             # ── Step 1: Hand Quality Check (Optimization 7) ─────────────────
             quality_ok, quality_msg = check_hand_quality(hand_lm)
-            
+
             # ── Step 2: Motion Check (Optimization 8) ───────────────────────
             is_moving = False
             movement_val = 0.0
@@ -2126,101 +3146,63 @@ def main():
                         features = extract_landmarks(hand_lm).reshape(1, -1)
 
                     features_scaled = scaler.transform(features)
-                    current_prediction = le.inverse_transform(model.predict(features_scaled))[0]
-                    probabilities = model.predict_proba(features_scaled)[0]
-                    confidence = float(np.max(probabilities))
+                    raw_pred = model.predict(features_scaled)[0]
+                    current_prediction = le.inverse_transform([raw_pred])[0]
 
-                    # Post-processing verification and correction layer for G & H
-                    if current_prediction in ("G", "H"):
-                        finger_count = count_extended_fingers(hand_lm)
-                        if confidence >= 0.80:
-                            if finger_count in (1, 2):
-                                corrected_prediction = "G" if finger_count == 1 else "H"
-                                print(f"[GH CHECK]\nOriginal: {current_prediction}\nFingers: {finger_count}\nCorrected: {corrected_prediction}")
-                                current_prediction = corrected_prediction
-                            elif finger_count != -1:
-                                # Failsafe: if count is determined but not 1 or 2, keep original but log check
-                                print(f"[GH CHECK]\nOriginal: {current_prediction}\nFingers: {finger_count}\nCorrected: {current_prediction}")
+                    # ── PHASE 6: Calibrated confidence ─────────────────────────
+                    logits = model.predict_log_proba(features_scaled)
+                    calibrated = calibrate_confidence(logits)[0]
+                    top2_indices = np.argsort(calibrated)[-2:][::-1]
+                    confidence = float(calibrated[top2_indices[0]])
+                    second_best_confidence = float(calibrated[top2_indices[1]])
+                    second_best_prediction = le.inverse_transform(
+                        [top2_indices[1]]
+                    )[0]
 
-                    # Post-processing verification and correction layer for A & I
-                    if current_prediction in ("A", "I"):
+                    # ── PHASE 10-11: Collision auto-correction ────────────────
+                    auto_corrected = False
+                    correction_rule = None
+                    collision_risk = confidence - second_best_confidence
+
+                    # Extract raw landmarks for rule engine if collision risk is high
+                    if collision_risk < COLLISION_RISK_THRESHOLD:
                         try:
-                            if hasattr(hand_lm, 'landmark'):
-                                coords = np.array([[lm.x, lm.y, lm.z] for lm in hand_lm.landmark], dtype=np.float32)
-                            else:
-                                coords = np.array(hand_lm, dtype=np.float32).reshape(21, 3)
-                            wrist = coords[0]
-                            translated = coords - wrist
-                            hand_scale = np.linalg.norm(translated[9])
-                            if hand_scale < 1e-6:
-                                hand_scale = 1.0
-                            normalized = translated / hand_scale
-                            
-                            pinky_extended = np.linalg.norm(normalized[20]) > np.linalg.norm(normalized[18])
-                            corrected_prediction = "I" if pinky_extended else "A"
-                            
-                            if corrected_prediction != current_prediction:
-                                print(f"[AI CHECK]\nOriginal: {current_prediction}\nPinky Extended: {pinky_extended}\nCorrected: {corrected_prediction}")
-                                current_prediction = corrected_prediction
+                            raw_lm_21x3 = extract_landmarks_for_rules(hand_lm)
+                            corrected, rule_conf, did_correct, rule_name = \
+                                rule_engine.verify(
+                                    current_prediction,
+                                    second_best_prediction,
+                                    raw_lm_21x3
+                                )
+                            if did_correct:
+                                print(
+                                    f"[RULE CORRECTION] {current_prediction} -> {corrected} "
+                                    f"(rule: {rule_name}, conf: {rule_conf:.2f})"
+                                )
+                                current_prediction = corrected
+                                confidence = max(confidence, rule_conf * 0.95)
+                                auto_corrected = True
+                                correction_rule = rule_name
                         except Exception as e:
-                            print(f"[AI CHECK] Error checking pinky: {e}")
+                            print(f"[RULE ENGINE] Error: {e}")
 
-                    # Post-processing verification and correction layer for D & I
-                    if current_prediction in ("D", "I"):
-                        try:
-                            if hasattr(hand_lm, 'landmark'):
-                                coords = np.array([[lm.x, lm.y, lm.z] for lm in hand_lm.landmark], dtype=np.float32)
-                            else:
-                                coords = np.array(hand_lm, dtype=np.float32).reshape(21, 3)
-                            wrist = coords[0]
-                            translated = coords - wrist
-                            hand_scale = np.linalg.norm(translated[9])
-                            if hand_scale < 1e-6:
-                                hand_scale = 1.0
-                            normalized = translated / hand_scale
-                            
-                            index_extended = np.linalg.norm(normalized[8]) > np.linalg.norm(normalized[6])
-                            pinky_extended = np.linalg.norm(normalized[20]) > np.linalg.norm(normalized[18])
-                            
-                            if index_extended and not pinky_extended:
-                                corrected_prediction = "D"
-                            elif pinky_extended and not index_extended:
-                                corrected_prediction = "I"
-                            else:
-                                corrected_prediction = current_prediction
-                            
-                            if corrected_prediction != current_prediction:
-                                print(f"[DI CHECK]\nOriginal: {current_prediction}\nIndex Extended: {index_extended}\nPinky Extended: {pinky_extended}\nCorrected: {corrected_prediction}")
-                                current_prediction = corrected_prediction
-                        except Exception as e:
-                            print(f"[DI CHECK] Error checking fingers: {e}")
-
-                    # Post-processing verification and correction layer for K & V
-                    if current_prediction in ("K", "V"):
-                        try:
-                            if hasattr(hand_lm, 'landmark'):
-                                coords = np.array([[lm.x, lm.y, lm.z] for lm in hand_lm.landmark], dtype=np.float32)
-                            else:
-                                coords = np.array(hand_lm, dtype=np.float32).reshape(21, 3)
-                            wrist = coords[0]
-                            translated = coords - wrist
-                            hand_scale = np.linalg.norm(translated[9])
-                            if hand_scale < 1e-6:
-                                hand_scale = 1.0
-                            normalized = translated / hand_scale
-                            
-                            # Distance between thumb tip (4) and middle PIP (10)
-                            d_4_10 = np.linalg.norm(normalized[4] - normalized[10])
-                            corrected_prediction = "K" if d_4_10 < 0.48 else "V"
-                            
-                            if corrected_prediction != current_prediction:
-                                print(f"[KV CHECK]\nOriginal: {current_prediction}\nDistance 4-10: {d_4_10:.4f}\nCorrected: {corrected_prediction}")
-                                current_prediction = corrected_prediction
-                        except Exception as e:
-                            print(f"[KV CHECK] Error checking fingers: {e}")
+                    # Store collision debug info for HUD
+                    collision_debug.update({
+                        "prediction": current_prediction,
+                        "confidence": confidence,
+                        "second_best": second_best_prediction,
+                        "second_conf": second_best_confidence,
+                        "collision_risk": round(collision_risk, 3),
+                        "auto_corrected": auto_corrected,
+                        "rule_used": correction_rule,
+                    })
 
                     # ── Step 3: Confidence Filtering ─────────────────────────────
-                    filtered_pred = current_prediction if confidence >= CONFIDENCE_THRESHOLD else None
+                    filtered_pred = (
+                        current_prediction
+                        if confidence >= CONFIDENCE_THRESHOLD
+                        else None
+                    )
                     prediction_history.append(filtered_pred)
                 else:
                     # During recovery, we bypass prediction and clear hold timer to be safe,
@@ -2255,7 +3237,9 @@ def main():
                                 # Set feedback
                                 feedback_message = f"Added: {stable_prediction}"
                                 feedback_timestamp = now
-                                print(f"[COMMIT] '{stable_prediction}' added. Word: {''.join(word_buffer)}")
+                                print(
+                                    f"[COMMIT] '{stable_prediction}' added. Word: {''.join(word_buffer)}"
+                                )
                     else:
                         # Same letter, but not locked (first occurrence)
                         if hold_timer_start is None:
@@ -2272,7 +3256,9 @@ def main():
 
                                 feedback_message = f"Added: {stable_prediction}"
                                 feedback_timestamp = now
-                                print(f"[COMMIT] '{stable_prediction}' added. Word: {''.join(word_buffer)}")
+                                print(
+                                    f"[COMMIT] '{stable_prediction}' added. Word: {''.join(word_buffer)}"
+                                )
                 else:
                     hold_timer_start = None
         else:
@@ -2293,7 +3279,7 @@ def main():
         # ── Monitor Emergency Keywords ──────────────────────────────────────
         current_word_str = "".join(word_buffer).strip()
         current_sentence_str = " ".join(sentence_buffer).strip()
-        
+
         # Translate for emergency check if Tamil mode is active (Phase 1)
         current_translated_str = ""
         if selected_language == "Tamil":
@@ -2301,43 +3287,63 @@ def main():
                 current_translated_str = translate_to_tamil(current_sentence_str)
             elif current_word_str:
                 current_translated_str = translate_to_tamil(current_word_str)
-        
+
         # Check both recognized English and translated Tamil streams (Phase 1)
         detected_kw = is_emergency_text(current_word_str)
         if not detected_kw:
             detected_kw = is_emergency_text(current_sentence_str)
         if not detected_kw and current_translated_str:
             detected_kw = is_emergency_text(current_translated_str)
-            
+
         if detected_kw:
             if now - last_emergency_trigger_time >= emergency_cooldown_duration:
                 # Calculate appropriate confidence score based on the stream that triggered (Phase 5)
                 if is_emergency_text(current_word_str):
-                    emergency_confidence = float(np.mean(word_confidences)) * 100.0 if word_confidences else confidence * 100.0
+                    emergency_confidence = (
+                        float(np.mean(word_confidences)) * 100.0
+                        if word_confidences
+                        else confidence * 100.0
+                    )
                 elif is_emergency_text(current_sentence_str):
-                    emergency_confidence = float(np.mean(sentence_confidences)) * 100.0 if sentence_confidences else confidence * 100.0
-                elif current_translated_str and is_emergency_text(current_translated_str):
+                    emergency_confidence = (
+                        float(np.mean(sentence_confidences)) * 100.0
+                        if sentence_confidences
+                        else confidence * 100.0
+                    )
+                elif current_translated_str and is_emergency_text(
+                    current_translated_str
+                ):
                     if current_sentence_str:
-                        emergency_confidence = float(np.mean(sentence_confidences)) * 100.0 if sentence_confidences else confidence * 100.0
+                        emergency_confidence = (
+                            float(np.mean(sentence_confidences)) * 100.0
+                            if sentence_confidences
+                            else confidence * 100.0
+                        )
                     else:
-                        emergency_confidence = float(np.mean(word_confidences)) * 100.0 if word_confidences else confidence * 100.0
+                        emergency_confidence = (
+                            float(np.mean(word_confidences)) * 100.0
+                            if word_confidences
+                            else confidence * 100.0
+                        )
                 else:
                     emergency_confidence = confidence * 100.0
-                
+
                 emergency_confidence = max(0.0, min(100.0, emergency_confidence))
-                
+
                 emergency_active = True
                 emergency_keyword = detected_kw
                 emergency_trigger_time = now
                 emergency_language = selected_language
                 last_emergency_trigger_time = now
                 whatsapp_status = "Opening..."
-                
-                print(f"[EMERGENCY] Active! Keyword: {detected_kw} | Confidence: {emergency_confidence:.1f}%")
-                
+
+                print(
+                    f"[EMERGENCY] Active! Keyword: {detected_kw} | Confidence: {emergency_confidence:.1f}%"
+                )
+
                 # 1. Sound Alert (non-blocking background thread)
                 trigger_sound_alert()
-                
+
                 # 2. Priority Speech / Bilingual Audio Feedback (Phase 6)
                 if selected_language == "Tamil":
                     priority_text = "அவசர நிலை கண்டறியப்பட்டது. வாட்ஸ்அப் எச்சரிக்கை தயாராக உள்ளது."
@@ -2347,9 +3353,14 @@ def main():
                     priority_text = "Emergency detected. WhatsApp alert prepared."
                     speech_lang = "English"
                     english_fallback = ""
-                
-                tts.speak(priority_text, language=speech_lang, volume=1.0, english_fallback=english_fallback)
-                
+
+                tts.speak(
+                    priority_text,
+                    language=speech_lang,
+                    volume=1.0,
+                    english_fallback=english_fallback,
+                )
+
                 # 3. WhatsApp Web Alert & Supabase Logging (Phase 2, 3, 7)
                 # Run in a background thread to prevent UI freezing
                 def run_alert_pipeline(kw, recognized, translated, lang, conf):
@@ -2357,13 +3368,19 @@ def main():
                     err_msg = None
                     try:
                         # Try to open WhatsApp Web (Phase 3)
-                        send_whatsapp_alert(kw, recognized, lang, conf, profile=current_profile)
+                        send_whatsapp_alert(
+                            kw, recognized, lang, conf
+                        )
                         whatsapp_status = "Success"
                     except Exception as wa_err:
                         err_msg = str(wa_err)
-                        whatsapp_status = f"Failed - {err_msg[:25]}..." if len(err_msg) > 25 else f"Failed - {err_msg}"
+                        whatsapp_status = (
+                            f"Failed - {err_msg[:25]}..."
+                            if len(err_msg) > 25
+                            else f"Failed - {err_msg}"
+                        )
                         print(f"[ERROR] WhatsApp Web failed to open: {wa_err}")
-                    
+
                     # Log the event (and any error) to Supabase (Phase 2 & 7)
                     save_emergency_event(
                         detected_keyword=kw,
@@ -2371,33 +3388,52 @@ def main():
                         translated_text=translated,
                         language=lang,
                         confidence=conf,
-                        error_message=err_msg
+                        error_message=err_msg,
                     )
-                
-                db_translated = current_translated_str if current_translated_str else (translate_to_tamil(current_sentence_str) if selected_language == "Tamil" else "")
-                
+
+                db_translated = (
+                    current_translated_str
+                    if current_translated_str
+                    else (
+                        translate_to_tamil(current_sentence_str)
+                        if selected_language == "Tamil"
+                        else ""
+                    )
+                )
+
                 alert_thread = threading.Thread(
                     target=run_alert_pipeline,
-                    args=(detected_kw, current_sentence_str if current_sentence_str else current_word_str, db_translated, selected_language, emergency_confidence),
-                    daemon=True
+                    args=(
+                        detected_kw,
+                        current_sentence_str
+                        if current_sentence_str
+                        else current_word_str,
+                        db_translated,
+                        selected_language,
+                        emergency_confidence,
+                    ),
+                    daemon=True,
                 )
                 alert_thread.start()
-                
+
                 # Increment count
                 emergency_count_today += 1
-                
+
                 # 4. Print history in console (delayed print to allow write completion)
                 def delayed_history():
                     time.sleep(1.5)
                     print_emergency_history()
+
                 threading.Thread(target=delayed_history, daemon=True).start()
-                
+
                 # 5. Future hooks
                 send_sms_alert(detected_kw, current_sentence_str, selected_language)
                 send_email_alert(detected_kw, current_sentence_str, selected_language)
                 notify_caregiver(detected_kw, current_sentence_str, selected_language)
                 loc = share_location()
-                print(f"[FUTURE READY] Share location: Lat: {loc.get('lat')}, Lon: {loc.get('lon')} ({loc.get('city')}, {loc.get('country')})")
+                print(
+                    f"[FUTURE READY] Share location: Lat: {loc.get('lat')}, Lon: {loc.get('lon')} ({loc.get('city')}, {loc.get('country')})"
+                )
 
         # ── Get Emotion Result ──────────────────────────────────────────
         emotion_str = "Neutral"
@@ -2435,9 +3471,12 @@ def main():
             "current_emotion": emotion_str,
             "emotion_confidence": emotion_conf,
             "process_time_ms": frame_process_time_ms,
-            "avg_process_time_ms": float(np.mean(process_time_history)) if process_time_history else 0.0,
+            "avg_process_time_ms": float(np.mean(process_time_history))
+            if process_time_history
+            else 0.0,
             "smoother_alpha": landmark_smoother.current_alpha,
             "finger_count": finger_count,
+            "collision_debug": collision_debug,
         }
 
         # ── Frame Processing Time ───────────────────────────────────────────
@@ -2455,11 +3494,21 @@ def main():
             display_translated = translator.translate(sentence_text)
 
         # ── Draw HUD ────────────────────────────────────────────────────
-        draw_hud(frame, current_prediction, confidence, probabilities,
-                 label_names, word_buffer, sentence_buffer, fps,
-                 hand_detected, hud_state, tts.status,
-                 selected_language=selected_language,
-                 translated_text=display_translated)
+        draw_hud(
+            frame,
+            current_prediction,
+            confidence,
+            probabilities,
+            label_names,
+            word_buffer,
+            sentence_buffer,
+            fps,
+            hand_detected,
+            hud_state,
+            tts.status,
+            selected_language=selected_language,
+            translated_text=display_translated,
+        )
 
         cv2.imshow("ASL Sign Language Recognition", frame)
 
@@ -2483,8 +3532,10 @@ def main():
             if current_word:
                 sentence_buffer.append(current_word)
                 sentence_confidences.extend(word_confidences)
-                print(f"[WORD] \"{current_word}\" added to sentence. "
-                      f"Sentence: {' '.join(sentence_buffer)}")
+                print(
+                    f'[WORD] "{current_word}" added to sentence. '
+                    f"Sentence: {' '.join(sentence_buffer)}"
+                )
             word_buffer.clear()
             word_confidences.clear()
             last_added_letter = None
@@ -2504,23 +3555,10 @@ def main():
             feedback_timestamp = now
 
         elif key in (ord("p"), ord("P")):
-            print("[PROFILE] Opening profile update window...")
-            import tkinter as tk
-            temp_root = tk.Tk()
-            temp_root.withdraw()  # Hide the main window
-            from auth_gui import edit_user_profile
-            updated_profile = edit_user_profile(temp_root, auth_user_id, current_profile)
-            if updated_profile:
-                current_profile = updated_profile
-                # Dynamically update language if it changed
-                new_lang = current_profile.get("preferred_language", "English")
-                if new_lang in ["English", "Tamil"] and new_lang != selected_language:
-                    selected_language = new_lang
-                    translator.target_lang = new_lang
-                    print(f"[PROFILE] Language auto-switched to: {selected_language}")
-                feedback_message = "Profile Updated"
-                feedback_timestamp = now
-            temp_root.destroy()
+            # Profile info display (no auth needed)
+            print(f"[PROFILE] Current user: {current_user.get('name', 'Unknown')}")
+            feedback_message = f"User: {current_user.get('name', 'Unknown')}"
+            feedback_timestamp = now
 
         elif key == 8:  # BACKSPACE
             if word_buffer:
@@ -2545,7 +3583,9 @@ def main():
                 print(f"[DEBUG] Text:\n{full_sentence}")
 
                 if sentence_confidences:
-                    avg_conf = (sum(sentence_confidences) / len(sentence_confidences)) * 100.0
+                    avg_conf = (
+                        sum(sentence_confidences) / len(sentence_confidences)
+                    ) * 100.0
                 else:
                     avg_conf = 100.0
                 avg_conf = round(avg_conf, 1)
@@ -2562,7 +3602,9 @@ def main():
                             print(f"[TAMIL] Translated: {translated}")
                         except Exception:
                             try:
-                                print(f"[TAMIL] Translated: {translated.encode('utf-8', errors='replace')}")
+                                print(
+                                    f"[TAMIL] Translated: {translated.encode('utf-8', errors='replace')}"
+                                )
                             except Exception:
                                 pass
                     else:
@@ -2571,17 +3613,23 @@ def main():
                     speak_text = full_sentence
                     english_fallback = ""
 
-                spoken = tts.speak(speak_text, language=tts_language, english_fallback=english_fallback)
+                spoken = tts.speak(
+                    speak_text, language=tts_language, english_fallback=english_fallback
+                )
                 print(f"[DEBUG] speak() returned:\n{spoken}")
                 if spoken:
                     feedback_message = f"Speaking: {full_sentence}"
                     feedback_timestamp = now
 
                     # Save to Supabase with language and translation info
-                    save_recognition(recognized_text=full_sentence,
-                                     translated_text=translated if selected_language == "Tamil" else "",
-                                     selected_language=selected_language,
-                                     confidence=avg_conf)
+                    save_recognition(
+                        recognized_text=full_sentence,
+                        translated_text=translated
+                        if selected_language == "Tamil"
+                        else "",
+                        selected_language=selected_language,
+                        confidence=avg_conf,
+                    )
             else:
                 print("[TTS] No text available to speak.")
                 feedback_message = "No text to speak"
