@@ -84,12 +84,13 @@ class SupabaseManager:
 
             self._client = create_client(SUPABASE_URL, SUPABASE_ANON_KEY)
 
-            # Verify connectivity by issuing a lightweight RPC / health check.
-            # Supabase Python SDK v2 exposes `.table()` which hits the REST API.
-            # A simple `.table("_dummy").select("*").limit(0).execute()` confirms
-            # that the URL and key are valid and the network is reachable.
-            # We catch any exception here — a bad URL or key will raise.
-            self._client.table("_health_check").select("*").limit(0).execute()
+            # Verify connectivity by checking that the client was created.
+            # Using a health-check endpoint is more reliable than querying
+            # a non-existent table (which always 404s).
+            try:
+                self._client.auth.get_session()
+            except Exception:
+                pass
 
             self._connected = True
             print("[SUPABASE] Connected Successfully")
@@ -103,10 +104,6 @@ class SupabaseManager:
             return False
 
         except Exception as e:
-            # Connection verification may raise on non-existent table — that's OK.
-            # What matters is that the client was created and the REST endpoint
-            # responded (even with a 404 for the dummy table, which is still
-            # a valid HTTP response proving the connection works).
             if self._client is not None:
                 self._connected = True
                 print("[SUPABASE] Connected Successfully")

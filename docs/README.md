@@ -6,7 +6,7 @@
   <img src="https://img.shields.io/badge/MediaPipe-Hand_Tracking-orange?style=for-the-badge">
   <img src="https://img.shields.io/badge/MLP-Classification-green?style=for-the-badge">
   <img src="https://img.shields.io/badge/Supabase-Database-success?style=for-the-badge">
-  <img src="https://img.shields.io/badge/DeepFace-Emotion_AI-red?style=for-the-badge">
+  <img src="https://img.shields.io/badge/FER-Emotion_AI-red?style=for-the-badge">
 </p>
 
 ---
@@ -55,10 +55,10 @@ Webcam
    │           ▼
    │    Sign Recognition
    │
-   └── DeepFace
+   └── FER (Facial Expression Recognition)
                │
                ▼
-      Emotion Detection
+       Emotion Detection
                │
                ▼
 
@@ -93,7 +93,7 @@ Webcam
 
 ## 😀 Facial Emotion Detection
 
-Using DeepFace:
+Using FER (Facial Expression Recognition):
 
 - 😊 Happy
 - 😢 Sad
@@ -214,7 +214,7 @@ A-Z Sign Predictions
 Model:
 
 ```text
-DeepFace
+FER (Facial Expression Recognition)
 ```
 
 Output:
@@ -249,7 +249,7 @@ Python
 ```text
 MediaPipe
 Scikit-Learn
-DeepFace
+FER
 NumPy
 ```
 

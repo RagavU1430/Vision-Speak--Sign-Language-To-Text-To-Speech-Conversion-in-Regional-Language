@@ -1,0 +1,37 @@
+# VisionSpeak Dependencies
+# install with: pip install -r requirements.txt
+
+# Runtime - Core
+opencv-python>=4.8.0
+mediapipe>=0.10.0
+numpy>=1.24.0
+joblib>=1.2.0
+scikit-learn>=1.2.0
+
+# Runtime - Speech & Translation
+pyttsx3>=2.90
+gtts>=2.3.0
+pygame>=2.5.0
+deep-translator>=1.9.0
+Pillow>=10.0.0
+
+# Runtime - Database
+supabase>=2.0.0
+python-dotenv>=1.0.0
+
+# Runtime - Emotion Detection
+fer>=2021.4.0
+
+# Runtime - Windows COM (for pyttsx3)
+pywin32>=306
+
+# Runtime - HTTP (for translation APIs)
+httpcore>=1.0.0
+requests>=2.31.0
+
+# Training & Data Processing
+pandas>=2.0.0
+matplotlib>=3.7.0
+seaborn>=0.12.0
+tqdm>=4.65.0
+scipy>=1.10.0

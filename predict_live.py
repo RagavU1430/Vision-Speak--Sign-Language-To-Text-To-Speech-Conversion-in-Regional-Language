@@ -67,6 +67,7 @@ if not hasattr(httpcore, "SyncHTTPTransport"):
 import functools
 import json
 import sys
+import tempfile
 import threading
 import time
 from collections import Counter, deque
@@ -225,21 +226,23 @@ MP_STATIC_IMAGE_MODE = False
 #   the detector from splitting attention between hands.
 MP_MAX_NUM_HANDS = 1
 
-# min_detection_confidence=0.70: lower threshold keeps the fast tracking path active
-#   more often, avoiding expensive full-frame re-detection. Tradeoff: speed > strictness.
-MP_MIN_DETECTION_CONFIDENCE = 0.70
+# model_complexity=1: balanced landmark accuracy (0=lite, 1=balanced, 2=heavy)
+MP_MODEL_COMPLEXITY = 1
 
-# min_tracking_confidence=0.70: lower threshold maintains tracking continuity,
-#   preventing frequent re-detection that adds latency. Tradeoff: speed > strictness.
-MP_MIN_TRACKING_CONFIDENCE = 0.70
+# min_detection_confidence=0.80: higher threshold filters out false hand detections.
+MP_MIN_DETECTION_CONFIDENCE = 0.80
+
+# min_tracking_confidence=0.80: higher threshold ensures tracking stability and accuracy.
+MP_MIN_TRACKING_CONFIDENCE = 0.80
 
 # ── Adaptive EMA Landmark Smoothing Configuration ───────────────────────────
 # Motion-adaptive smoothing: low alpha = more smoothing, high alpha = more responsive.
 # When hand is stationary → alpha_slow (stable, reduces jitter)
 # When hand moves quickly  → alpha_fast (near-raw, eliminates lag)
-EMA_ALPHA_SLOW = 0.4  # Smoothing alpha when hand is stationary
+EMA_ALPHA_SLOW = 0.25  # Smoothing alpha when hand is stationary (lowered from 0.4 for extra stability)
 EMA_ALPHA_FAST = 0.9  # Smoothing alpha when hand moves fast
 EMA_SPEED_THRESHOLD = 0.01  # Landmark displacement threshold for fast mode
+
 
 # ── Hysteresis Configuration ───────────────────────────────────────────────
 # HAND_MISSING_GRACE_FRAMES=5: continue displaying last valid landmarks for
@@ -544,7 +547,8 @@ class CollisionRuleEngine:
 
 def calibrate_confidence(logits, temperature=TEMPERATURE_SCALE):
     """Apply temperature scaling to logits for calibrated confidence."""
-    scaled = logits / temperature
+    logits_2d = np.atleast_2d(logits)
+    scaled = logits_2d / temperature
     exp_s = np.exp(scaled - scaled.max(axis=1, keepdims=True))
     return exp_s / exp_s.sum(axis=1, keepdims=True)
 
@@ -1059,7 +1063,9 @@ class SpeechEngine:
             try:
                 if language == "Tamil":
                     tamil_tts_success = False
-                    temp_file_path = "temp.mp3"
+                    temp_file = tempfile.NamedTemporaryFile(suffix=".mp3", delete=False)
+                    temp_file_path = temp_file.name
+                    temp_file.close()
 
                     # 1. Attempt Tamil Audio Generation using gTTS
                     try:
@@ -1093,7 +1099,6 @@ class SpeechEngine:
                         except Exception as e:
                             print(f"[ERROR] Tamil Playback Failed: {e}")
                         finally:
-                            # Wait for audio playback to finish before deleting temp.mp3
                             for _ in range(5):
                                 try:
                                     if os.path.exists(temp_file_path):
@@ -3004,7 +3009,10 @@ def get_majority_prediction(history, consistency_threshold):
 # ═══════════════════════════════════════════════════════════════════════════
 
 
-def main():
+_active_resources = {}
+
+
+def _main_impl():
     global current_user
 
     # ── User profile: load from profile.json or show setup form ───────────────
@@ -3050,6 +3058,7 @@ def main():
 
     # ── Initialize TTS engine (singleton) ───────────────────────────────────
     tts = SpeechEngine()
+    _active_resources['tts'] = tts
 
     # ── Initialize Supabase ─────────────────────────────────────────────────
     supabase = SupabaseManager()
@@ -3075,12 +3084,15 @@ def main():
     hands = mp_hands.Hands(
         static_image_mode=MP_STATIC_IMAGE_MODE,
         max_num_hands=MP_MAX_NUM_HANDS,
+        model_complexity=MP_MODEL_COMPLEXITY,
         min_detection_confidence=MP_MIN_DETECTION_CONFIDENCE,
         min_tracking_confidence=MP_MIN_TRACKING_CONFIDENCE,
     )
+    _active_resources['hands'] = hands
 
     # ── Webcam ──────────────────────────────────────────────────────────────
     cap = cv2.VideoCapture(0)
+    _active_resources['cap'] = cap
     if not cap.isOpened():
         print("[ERROR] Cannot open webcam.")
         sys.exit(1)
@@ -3095,6 +3107,7 @@ def main():
     # ── Hand Tracking Stability & Hysteresis State Variables ────────────────
     landmark_smoother = AdaptiveLandmarkSmoother()
     emotion_detector = EmotionDetector(detect_every_n=EMOTION_DETECT_INTERVAL)
+    _active_resources['emotion_detector'] = emotion_detector
     stability_buffer = deque(maxlen=STABILITY_BUFFER_SIZE)
     hand_missing_frames = 0
     last_valid_hand_lm = None
@@ -3165,6 +3178,7 @@ def main():
         ret, frame = cap.read()
         if not ret:
             print("[WARN] Failed to read frame, retrying...")
+            time.sleep(0.1)
             continue
 
         frame = cv2.flip(frame, 1)  # mirror for natural interaction
@@ -3308,11 +3322,12 @@ def main():
                         features = extract_landmarks(hand_lm).reshape(1, -1)
 
                     features_scaled = scaler.transform(features)
-                    raw_pred = model.predict(features_scaled)[0]
+                    probs = model.predict_proba(features_scaled)[0]
+                    raw_pred = np.argmax(probs)
                     current_prediction = le.inverse_transform([raw_pred])[0]
 
                     # ── PHASE 6: Calibrated confidence ─────────────────────────
-                    logits = model.predict_log_proba(features_scaled)
+                    logits = np.log(probs + 1e-12)
                     calibrated = calibrate_confidence(logits)[0]
                     top2_indices = np.argsort(calibrated)[-2:][::-1]
                     confidence = float(calibrated[top2_indices[0]])
@@ -3810,5 +3825,41 @@ def main():
     print(f"     Final sentence: {final_sentence}")
 
 
+def main():
+    try:
+        _main_impl()
+    finally:
+        # Robust cleanup to release resources if an error occurs
+        ed = _active_resources.get('emotion_detector')
+        if ed:
+            try:
+                ed.shutdown()
+            except Exception:
+                pass
+        t = _active_resources.get('tts')
+        if t:
+            try:
+                t.shutdown()
+            except Exception:
+                pass
+        h = _active_resources.get('hands')
+        if h:
+            try:
+                h.close()
+            except Exception:
+                pass
+        c = _active_resources.get('cap')
+        if c:
+            try:
+                c.release()
+            except Exception:
+                pass
+        try:
+            cv2.destroyAllWindows()
+        except Exception:
+            pass
+
+
 if __name__ == "__main__":
     main()
+

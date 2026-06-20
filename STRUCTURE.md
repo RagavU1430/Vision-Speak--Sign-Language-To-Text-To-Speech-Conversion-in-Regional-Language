@@ -1,14 +1,17 @@
+# VisionSpeak — Sign Language Recognition Project
+# Requires Python 3.10+
+
 SIGN LANG PROJECT
 │
 ├── .env
 ├── .gitignore
+├── requirements.txt                 # Project dependencies
 ├── predict_live.py                  # Main entry point
 ├── profile.json                     # Runtime data
 │
-├── archive/                         # Unchanged
+├── archive/
 │   ├── asl_alphabet_train/
-│   ├── asl_alphabet_test/
-│   └── filename.py
+│   └── asl_alphabet_test/
 │
 ├── assets/
 │   └── artifacts/
@@ -50,12 +53,10 @@ SIGN LANG PROJECT
 ├── logs/
 │   └── test/
 │
-├── models/                          # Unchanged
+├── models/
 │   ├── mlp_model.pkl
 │   ├── scaler.pkl
 │   ├── label_encoder.pkl
-│   ├── label_encoder_enhanced.pkl
-│   ├── model_metadata.pkl
 │   ├── confusion_matrix.png
 │   ├── model_comparison_report.md
 │   └── collision_report/
