@@ -407,3 +407,39 @@ def extract_enhanced_features_v2(hand_landmarks) -> np.ndarray:
 
     return np.concatenate([base, v2_features])  # 99 + 37 = 136 features
 
+
+class KerasMLPWrapper:
+    """
+    Wraps a Keras model to expose scikit-learn–compatible predict/predict_proba
+    methods. This allows predict_live.py to call model.predict_proba() without
+    any code changes to the prediction pipeline.
+    """
+
+    def __init__(self, keras_model_path: str):
+        self.keras_model_path = keras_model_path
+        self._model = None  # Lazy-loaded to avoid import at unpickle time
+
+    def _load(self):
+        """Lazy-load the Keras model on first use."""
+        if self._model is None:
+            import tensorflow as tf
+            self._model = tf.keras.models.load_model(self.keras_model_path)
+        return self._model
+
+    def predict_proba(self, X):
+        """Return class probabilities — shape (n_samples, n_classes)."""
+        model = self._load()
+        return model.predict(X, verbose=0)
+
+    def predict(self, X):
+        """Return predicted class indices — shape (n_samples,)."""
+        probs = self.predict_proba(X)
+        return np.argmax(probs, axis=1)
+
+    @property
+    def n_features_in_(self):
+        """Return expected input feature count for compatibility checks."""
+        model = self._load()
+        return model.input_shape[-1]
+
+

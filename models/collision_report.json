@@ -1,0 +1,14 @@
+{
+  "test_accuracy_pct": 100.0,
+  "test_precision_pct": 100.0,
+  "test_recall_pct": 100.0,
+  "test_f1_pct": 100.0,
+  "total_collision_pairs": 0,
+  "top_10_collisions": [],
+  "per_class_accuracy": {
+    "A": 100.0,
+    "B": 100.0,
+    "C": 100.0
+  },
+  "recommendations": []
+}

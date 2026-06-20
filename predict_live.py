@@ -84,6 +84,7 @@ from database.supabase_client import SupabaseManager
 from utils import (  # Enhanced landmarks and engineered features
     extract_enhanced_features,
     extract_raw_normalized_landmarks,
+    KerasMLPWrapper,
 )
 
 # ── Optional: PIL for Unicode (Tamil) text rendering ────────────────────
@@ -281,8 +282,11 @@ FEEDBACK_DISPLAY_DURATION = 1.0  # Seconds to show "Added X" confirmation
 # ── Confidence Calibration (PHASE 6) ────────────────────────────────────────
 TEMPERATURE_SCALE = 1.988  # Learned from collision_audit.py
 
-# ── Collision Detection Threshold ────────────────────────────────────────────
-COLLISION_RISK_THRESHOLD = 0.15  # If top-2 diff < 15%, check rules
+# ── Confidence Gap Validation (TASK 3) ─────────────────────────────────────
+# A prediction is accepted into voting history ONLY if:
+#   confidence >= 90% AND (top1_conf - top2_conf) >= GAP_THRESHOLD
+# This prevents ambiguous frames (e.g., G vs H at 45%/40%) from polluting history.
+GAP_THRESHOLD = 0.20  # Minimum gap between top-1 and top-2 to accept prediction
 
 # ── TTS Configuration ──────────────────────────────────────────────────────
 TTS_SPEECH_RATE = 150  # Words per minute
@@ -543,6 +547,107 @@ class CollisionRuleEngine:
                 return corrected, rule_conf, True, f"{rule_key[0]}/{rule_key[1]}"
 
         return raw_prediction, None, False, None
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# PHASE 12 — Robust Majority Voting System (TASK 2)
+# ═══════════════════════════════════════════════════════════════════════════
+
+class MajorityVoteSystem:
+    """
+    Temporal stabilization system that uses majority voting over a sliding
+    history window to produce stable predictions and reduce letter collisions.
+
+    Architecture:
+      1. Stores last N valid predictions with confidences.
+      2. Only accepts predictions above MIN_CONFIDENCE.
+      3. Counts occurrences of each prediction in the history window.
+      4. Computes agreement percentage.
+      5. Returns STABLE status only when agreement >= REQUIRED_AGREEMENT.
+      6. Prevents duplicate consecutive commits via last_committed_letter lock.
+      7. Resets lock when hand is removed or a different sign is shown.
+    """
+
+    def __init__(self, history_size=20, min_confidence=0.90, required_agreement=0.80):
+        self.history_size = history_size
+        self.min_confidence = min_confidence
+        self.required_agreement = required_agreement
+        self.history = deque(maxlen=history_size)
+        self.confidences = deque(maxlen=history_size)
+        self.last_committed_letter = None
+        self.stable_prediction = None
+        self.agreement_percentage = 0.0
+        self.history_length = 0
+
+    def add_prediction(self, prediction, confidence):
+        """Add a prediction to the sliding history window."""
+        if prediction is not None and confidence >= self.min_confidence:
+            self.history.append(prediction)
+            self.confidences.append(confidence)
+        else:
+            self.history.append(None)
+            self.confidences.append(0.0)
+        self.history_length = len(self.history)
+
+    def get_stable_prediction(self):
+        """
+        Compute the stable prediction from the voting history.
+
+        Returns: (prediction, agreement_percentage, status)
+          status is "STABLE" if agreement >= required_agreement,
+          otherwise "WAITING".
+        """
+        self.history_length = len(self.history)
+
+        if len(self.history) < self.history.maxlen:
+            self.stable_prediction = None
+            self.agreement_percentage = 0.0
+            return None, 0.0, "WAITING"
+
+        # Filter out None entries (low-confidence or unknown frames)
+        valid = [p for p in self.history if p is not None]
+        if not valid:
+            self.stable_prediction = None
+            self.agreement_percentage = 0.0
+            return None, 0.0, "WAITING"
+
+        # Count occurrences of each prediction
+        counter = Counter(valid)
+        most_common, count = counter.most_common(1)[0]
+        agreement = count / len(self.history)
+
+        self.stable_prediction = most_common
+        self.agreement_percentage = agreement
+
+        if agreement >= self.required_agreement:
+            return most_common, agreement, "STABLE"
+        else:
+            return most_common, agreement, "WAITING"
+
+    def should_commit(self, stable_prediction):
+        """Check if the stable prediction should be committed (no duplicates)."""
+        if stable_prediction is None:
+            return False
+        if stable_prediction == self.last_committed_letter:
+            return False
+        return True
+
+    def commit(self, letter):
+        """Lock this letter to prevent duplicate commits."""
+        self.last_committed_letter = letter
+
+    def reset_lock(self):
+        """Clear the committed-letter lock (hand removed or changed)."""
+        self.last_committed_letter = None
+
+    def clear(self):
+        """Reset the entire voting system state."""
+        self.history.clear()
+        self.confidences.clear()
+        self.last_committed_letter = None
+        self.stable_prediction = None
+        self.agreement_percentage = 0.0
+        self.history_length = 0
 
 
 def calibrate_confidence(logits, temperature=TEMPERATURE_SCALE):
@@ -1683,60 +1788,6 @@ def extract_landmarks(hand_landmarks) -> np.ndarray:
     return np.array(coords, dtype=np.float32).reshape(1, -1)
 
 
-def count_extended_fingers(hand_landmarks) -> int:
-    """
-    Count the number of extended fingers using MediaPipe landmarks.
-    Uses orientation-invariant Euclidean distances.
-    """
-    try:
-        # Extract 3D coordinates
-        if hasattr(hand_landmarks, "landmark"):
-            coords = np.array(
-                [[lm.x, lm.y, lm.z] for lm in hand_landmarks.landmark], dtype=np.float32
-            )
-        else:
-            coords = np.array(hand_landmarks, dtype=np.float32).reshape(21, 3)
-
-        # 1. Translate relative to wrist (landmark 0)
-        wrist = coords[0]
-        translated = coords - wrist
-
-        # 2. Normalize scale by wrist-to-middle-MCP (9) distance
-        hand_scale = np.linalg.norm(translated[9])
-        if hand_scale < 1e-6:
-            hand_scale = 1.0
-        normalized = translated / hand_scale
-
-        # 3. Determine if each finger is extended
-        # Thumb: extended if distance from tip (4) to index MCP (5) is > 0.8
-        thumb_extended = np.linalg.norm(normalized[4] - normalized[5]) > 0.8
-
-        # Other fingers: extended if distance from tip to wrist is greater than PIP to wrist
-        index_extended = np.linalg.norm(normalized[8]) > np.linalg.norm(normalized[6])
-        middle_extended = np.linalg.norm(normalized[12]) > np.linalg.norm(
-            normalized[10]
-        )
-        ring_extended = np.linalg.norm(normalized[16]) > np.linalg.norm(normalized[14])
-        pinky_extended = np.linalg.norm(normalized[20]) > np.linalg.norm(normalized[18])
-
-        extended_fingers = 0
-        if thumb_extended:
-            extended_fingers += 1
-        if index_extended:
-            extended_fingers += 1
-        if middle_extended:
-            extended_fingers += 1
-        if ring_extended:
-            extended_fingers += 1
-        if pinky_extended:
-            extended_fingers += 1
-
-        return extended_fingers
-    except Exception as e:
-        print(f"[GH CHECK] Error counting fingers: {e}")
-        return -1
-
-
 # ═══════════════════════════════════════════════════════════════════════════
 # HUD Drawing Utilities
 # ═══════════════════════════════════════════════════════════════════════════
@@ -2092,30 +2143,7 @@ def draw_confidence_bar(img, x, y, w, h, confidence, color):
         cv2.circle(img, p1, radius - 1, color, -1, cv2.LINE_AA)
 
 
-def draw_hold_progress_bar(img, x, y, w, h, progress, color):
-    """Draw a pill-shaped hold progress bar using anti-aliased lines."""
-    if h % 2 != 0:
-        h += 1
-    radius = h // 2
-    p1 = (x + radius, y + radius)
-    p2 = (x + w - radius, y + radius)
 
-    # Background line
-    cv2.line(img, p1, p2, (30, 30, 40), h, cv2.LINE_AA)
-
-    # Foreground line
-    fill_w = int(w * min(progress, 1.0))
-    if fill_w >= h:
-        cv2.line(
-            img,
-            p1,
-            (x + radius + int((w - 2 * radius) * progress), y + radius),
-            color,
-            h - 2,
-            cv2.LINE_AA,
-        )
-    elif fill_w > 0:
-        cv2.circle(img, p1, radius - 1, color, -1, cv2.LINE_AA)
 
 
 def draw_hud(
@@ -2137,9 +2165,10 @@ def draw_hud(
     Draw a polished heads-up display overlay.
 
     The `state` dict provides temporal-logic feedback:
-      - stable_prediction: the majority-voted prediction (or None)
-      - hold_elapsed: seconds held so far (0.0 if not holding)
-      - is_holding: True if currently counting down the hold timer
+      - vote_stable_prediction: the majority-voted prediction (or None)
+      - vote_agreement: agreement percentage among last N frames
+      - vote_status: "STABLE" or "WAITING"
+      - vote_history_len: how many frames in voting history
       - locked_until_reset: True if waiting for hand-reset
       - feedback_message: e.g. "Added A" (or None)
       - tracking_status: "ACTIVE", "LOST", or "RECOVERING"
@@ -2537,8 +2566,10 @@ def draw_hud(
                     max(1, int(1 * u_scale)), cv2.LINE_AA,
                 )
 
-            # ── Hold-time progress (temporal feedback) ──────────────────────────
+            # ── Voting Info & Status (TASK 2) ─────────────────────────────────
             y_hold = panel_y + int(220 * u_scale)
+
+            # Finger count helper (for G/H disambiguation)
             if prediction in ("G", "H") and state.get("finger_count", -1) != -1:
                 f_count = state["finger_count"]
                 cv2.putText(
@@ -2553,32 +2584,66 @@ def draw_hud(
                 )
                 y_hold += int(25 * u_scale)
 
-            if state["is_holding"]:
-                elapsed = state["hold_elapsed"]
-                progress = elapsed / HOLD_TIME_REQUIRED
-                hold_text = f"Hold: {elapsed:.1f} / {HOLD_TIME_REQUIRED:.1f}s"
-                bar_color = GREEN if progress > 0.8 else ORANGE
+            # Voting status and agreement
+            vote_status = state.get("vote_status", "WAITING")
+            vote_agreement = state.get("vote_agreement", 0.0)
+            vote_stable = state.get("vote_stable_prediction", None)
+            vote_history = state.get("vote_history_len", 0)
+
+            if vote_status == "STABLE" and vote_stable is not None:
+                # Show stable prediction from majority vote
+                agree_color = GREEN if vote_agreement >= 0.80 else ORANGE
                 cv2.putText(
                     frame,
-                    hold_text,
+                    f"Stable: {vote_stable} ({vote_agreement * 100:.0f}%)",
                     (panel_x + int(15 * u_scale), y_hold),
                     cv2.FONT_HERSHEY_SIMPLEX,
-                    0.48 * u_scale,
+                    0.50 * u_scale,
+                    agree_color,
+                    max(1, int(2 * u_scale)),
+                    cv2.LINE_AA,
+                )
+                y_hold += int(28 * u_scale)
+
+                # History info
+                cv2.putText(
+                    frame,
+                    f"History: {vote_history}/{state.get('vote_max', 20)} frames",
+                    (panel_x + int(15 * u_scale), y_hold),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    0.40 * u_scale,
+                    GRAY,
+                    max(1, int(1 * u_scale)),
+                    cv2.LINE_AA,
+                )
+                y_hold += int(25 * u_scale)
+            elif vote_status == "WAITING" and vote_history >= state.get("vote_max", 20):
+                cv2.putText(
+                    frame,
+                    f"Vote: {vote_agreement * 100:.0f}% (need 80%)",
+                    (panel_x + int(15 * u_scale), y_hold),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    0.45 * u_scale,
                     YELLOW,
                     max(1, int(1 * u_scale)),
                     cv2.LINE_AA,
                 )
-                draw_hold_progress_bar(
+                y_hold += int(25 * u_scale)
+            elif vote_history < state.get("vote_max", 20):
+                cv2.putText(
                     frame,
-                    panel_x + int(20 * u_scale),
-                    y_hold + int(8 * u_scale),
-                    panel_w - int(40 * u_scale),
-                    int(12 * u_scale),
-                    progress,
-                    bar_color,
+                    f"History: {vote_history}/{state.get('vote_max', 20)}",
+                    (panel_x + int(15 * u_scale), y_hold),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    0.40 * u_scale,
+                    GRAY,
+                    max(1, int(1 * u_scale)),
+                    cv2.LINE_AA,
                 )
-                y_hold += int(35 * u_scale)
-            elif state["locked_until_reset"]:
+                y_hold += int(25 * u_scale)
+
+            # Locked state
+            if state["locked_until_reset"]:
                 cv2.putText(
                     frame,
                     "Locked (change sign/remove hand)",
@@ -2981,29 +3046,6 @@ def draw_hud(
         )
 
 
-# ── Temporal Logic Engine ───────────────────────────────────────────────────
-
-
-def get_majority_prediction(history, consistency_threshold):
-    """
-    Analyse the prediction history using majority voting.
-
-    Returns (letter, ratio) if the most common prediction exceeds the
-    consistency threshold, otherwise (None, 0.0).
-    """
-    if len(history) < history.maxlen:
-        # Not enough history accumulated yet
-        return None, 0.0
-
-    counter = Counter(history)
-    most_common_letter, count = counter.most_common(1)[0]
-    ratio = count / len(history)
-
-    if ratio >= consistency_threshold:
-        return most_common_letter, ratio
-    return None, ratio
-
-
 # ═══════════════════════════════════════════════════════════════════════════
 # Main Application Loop
 # ═══════════════════════════════════════════════════════════════════════════
@@ -3124,15 +3166,12 @@ def _main_impl():
     confidence = 0.0  # Raw confidence from model this frame
     probabilities = np.zeros(len(label_names))
 
-    # Prediction history for majority voting (last 20 frames)
-    prediction_history = deque(maxlen=HISTORY_SIZE)
-
-    # Hold timer: tracks when a stable prediction first appeared
-    hold_timer_start = None  # time.time() when hold began, None if not holding
-
-    # Lock state: prevents re-adding the same letter
-    last_added_letter = None  # The last letter successfully committed
-    locked_until_reset = False  # True = waiting for hand removal or new sign
+    # ── Majority Vote System (TASK 2-3) ────────────────────────────────────
+    vote_system = MajorityVoteSystem(
+        history_size=HISTORY_SIZE,
+        min_confidence=CONFIDENCE_THRESHOLD,
+        required_agreement=CONSISTENCY_THRESHOLD,
+    )
 
     # Feedback overlay
     feedback_message = None  # e.g. "Added A"
@@ -3167,11 +3206,11 @@ def _main_impl():
     # Hand motion tracking
     prev_landmarks_pts = None
 
-    print("[STATE] Temporal logic engine active:")
+    print("[STATE] Majority vote system active:")
     print(f"        History window:   {HISTORY_SIZE} frames")
-    print(f"        Consistency:      >{CONSISTENCY_THRESHOLD * 100:.0f}%")
-    print(f"        Confidence:       >={CONFIDENCE_THRESHOLD * 100:.0f}%")
-    print(f"        Hold time:        {HOLD_TIME_REQUIRED}s")
+    print(f"        Agreement:        >={CONSISTENCY_THRESHOLD * 100:.0f}%")
+    print(f"        Min confidence:   >={CONFIDENCE_THRESHOLD * 100:.0f}%")
+    print(f"        Min gap:          >={GAP_THRESHOLD * 100:.0f}%")
     print(f"        Auto-clear:       {AUTO_CLEAR}\n")
 
     while True:
@@ -3233,6 +3272,9 @@ def _main_impl():
         # HAND DETECTED / HYSTERESIS PROCESSING
         # ================================================================
         hand_lm = None
+        vote_status = "WAITING"
+        stable_prediction = None
+        agreement_pct = 0.0
         if results.multi_hand_landmarks:
             hand_lm = results.multi_hand_landmarks[0]
             hand_missing_frames = 0
@@ -3295,20 +3337,19 @@ def _main_impl():
             # Store current landmarks for next frame motion check
             prev_landmarks_pts = [[lm.x, lm.y] for lm in hand_lm.landmark]
 
-            # ── Alphabet Model Processing ──
+            # ── Alphabet Model Processing (TASK 2-3) ──
             if not quality_ok:
                 hand_status = "Hand Not Ready"
                 hand_status_detail = quality_msg
                 current_prediction = None
                 confidence = 0.0
-                prediction_history.clear()
-                hold_timer_start = None
+                vote_system.clear()
             elif is_moving:
                 hand_status = "Hand Moving"
                 hand_status_detail = f"Speed: {movement_val:.3f}"
                 current_prediction = None
                 confidence = 0.0
-                hold_timer_start = None
+                vote_system.clear()
             else:
                 hand_status = "OK"
                 hand_status_detail = ""
@@ -3335,14 +3376,12 @@ def _main_impl():
                     second_best_prediction = le.inverse_transform(
                         [top2_indices[1]]
                     )[0]
+                    gap = confidence - second_best_confidence
 
-                    # ── PHASE 10-11: Collision auto-correction ────────────────
+                    # ── Rule engine correction for borderline predictions ─────
                     auto_corrected = False
                     correction_rule = None
-                    collision_risk = confidence - second_best_confidence
-
-                    # Extract raw landmarks for rule engine if collision risk is high
-                    if collision_risk < COLLISION_RISK_THRESHOLD:
+                    if gap < GAP_THRESHOLD:
                         try:
                             raw_lm_21x3 = extract_landmarks_for_rules(hand_lm)
                             corrected, rule_conf, did_correct, rule_name = \
@@ -3358,100 +3397,58 @@ def _main_impl():
                                 )
                                 current_prediction = corrected
                                 confidence = max(confidence, rule_conf * 0.95)
+                                gap = GAP_THRESHOLD + 0.01
                                 auto_corrected = True
                                 correction_rule = rule_name
                         except Exception as e:
                             print(f"[RULE ENGINE] Error: {e}")
 
-                    # Store collision debug info for HUD
                     collision_debug.update({
                         "prediction": current_prediction,
                         "confidence": confidence,
                         "second_best": second_best_prediction,
                         "second_conf": second_best_confidence,
-                        "collision_risk": round(collision_risk, 3),
+                        "collision_risk": round(gap, 3),
                         "auto_corrected": auto_corrected,
                         "rule_used": correction_rule,
                     })
 
-                    # ── Step 3: Confidence Filtering ─────────────────────────────
-                    filtered_pred = (
-                        current_prediction
-                        if confidence >= CONFIDENCE_THRESHOLD
-                        else None
-                    )
-                    prediction_history.append(filtered_pred)
-                else:
-                    # During recovery, we bypass prediction and clear hold timer to be safe,
-                    # but keep the last prediction visual representation on HUD.
-                    hold_timer_start = None
-
-                # ── Step 5: Majority voting ───────────────────────────────────
-                stable_prediction, consistency_ratio = get_majority_prediction(
-                    prediction_history, CONSISTENCY_THRESHOLD
-                )
-
-                # ── Step 6: Temporal decision logic ──────────────────────────
-                if stable_prediction is not None:
-                    # Check if locked: same letter was just added
-                    if locked_until_reset and stable_prediction == last_added_letter:
-                        hold_timer_start = None  # don't accumulate hold time
-                    elif stable_prediction != last_added_letter:
-                        # NEW LETTER detected (different from the locked one)
-                        locked_until_reset = False
-                        if hold_timer_start is None:
-                            hold_timer_start = now
-                        else:
-                            hold_elapsed = now - hold_timer_start
-                            if hold_elapsed >= HOLD_TIME_REQUIRED:
-                                # ── COMMIT THE LETTER ───────────────────────
-                                word_buffer.append(stable_prediction)
-                                word_confidences.append(confidence)
-                                last_added_letter = stable_prediction
-                                locked_until_reset = True
-                                hold_timer_start = None
-
-                                # Set feedback
-                                feedback_message = f"Added: {stable_prediction}"
-                                feedback_timestamp = now
-                                print(
-                                    f"[COMMIT] '{stable_prediction}' added. Word: {''.join(word_buffer)}"
-                                )
+                    # ── TASK 3: Accept prediction ONLY if:
+                    #    confidence >= 90% AND gap between top-1 and top-2 >= 20%
+                    #    Otherwise → UNKNOWN (do not add to voting history) ──
+                    if confidence >= CONFIDENCE_THRESHOLD and gap >= GAP_THRESHOLD:
+                        vote_system.add_prediction(current_prediction, confidence)
                     else:
-                        # Same letter, but not locked (first occurrence)
-                        if hold_timer_start is None:
-                            hold_timer_start = now
-                        else:
-                            hold_elapsed = now - hold_timer_start
-                            if hold_elapsed >= HOLD_TIME_REQUIRED:
-                                # ── COMMIT THE LETTER ───────────────────────
-                                word_buffer.append(stable_prediction)
-                                word_confidences.append(confidence)
-                                last_added_letter = stable_prediction
-                                locked_until_reset = True
-                                hold_timer_start = None
+                        vote_system.add_prediction(None, 0.0)  # UNKNOWN
+                # else: recovery frames — skip prediction
 
-                                feedback_message = f"Added: {stable_prediction}"
-                                feedback_timestamp = now
-                                print(
-                                    f"[COMMIT] '{stable_prediction}' added. Word: {''.join(word_buffer)}"
-                                )
-                else:
-                    hold_timer_start = None
+            # ── TASK 2: Get stable prediction from majority voting ──
+            stable_prediction, agreement_pct, vote_status = vote_system.get_stable_prediction()
+
+            # ── Commit letter when:
+            #    1. Vote status is "STABLE" (agreement >= 80%)
+            #    2. Prediction is not None
+            #    3. Not a duplicate of the last committed letter ──
+            if (vote_status == "STABLE"
+                    and stable_prediction is not None
+                    and vote_system.should_commit(stable_prediction)):
+                word_buffer.append(stable_prediction)
+                word_confidences.append(confidence)
+                vote_system.commit(stable_prediction)
+                feedback_message = f"Added: {stable_prediction}"
+                feedback_timestamp = now
+                print(
+                    f"[COMMIT] '{stable_prediction}' added. Word: {''.join(word_buffer)}"
+                )
         else:
             # No hand detected at all (and grace expired)
             hand_status = "No Hand Detected"
             hand_status_detail = ""
             current_prediction = None
             confidence = 0.0
-            prediction_history.clear()
-            hold_timer_start = None
+            vote_system.clear()
             prev_landmarks_pts = None
-
-            if locked_until_reset:
-                locked_until_reset = False
-                last_added_letter = None
-                print("[RESET] Hand removed — lock cleared.")
+            print("[RESET] Hand removed — lock cleared.")
 
         # ── Monitor Emergency Keywords ──────────────────────────────────────
         current_word_str = "".join(word_buffer).strip()
@@ -3622,17 +3619,13 @@ def _main_impl():
         stability_score = calculate_stability_score(stability_buffer)
 
         # ── Compute HUD state dict ──────────────────────────────────────
-        hold_elapsed = 0.0
-        is_holding = False
-        if hold_timer_start is not None:
-            hold_elapsed = now - hold_timer_start
-            is_holding = True
-
         hud_state = {
-            "stable_prediction": current_prediction,
-            "hold_elapsed": hold_elapsed,
-            "is_holding": is_holding,
-            "locked_until_reset": locked_until_reset,
+            "stable_prediction": vote_system.stable_prediction,
+            "hold_elapsed": 0.0,
+            "is_holding": False,
+            "locked_until_reset": (
+                vote_system.last_committed_letter is not None
+            ),
             "feedback_message": feedback_message,
             "emergency_active": emergency_active,
             "emergency_keyword": emergency_keyword,
@@ -3654,6 +3647,12 @@ def _main_impl():
             "smoother_alpha": landmark_smoother.current_alpha,
             "finger_count": finger_count,
             "collision_debug": collision_debug,
+            # Majority voting info for HUD (TASK 2)
+            "vote_stable_prediction": vote_system.stable_prediction,
+            "vote_agreement": vote_system.agreement_percentage,
+            "vote_status": vote_status,
+            "vote_history_len": vote_system.history_length,
+            "vote_max": vote_system.history_size,
         }
 
         # ── Frame Processing Time ───────────────────────────────────────────
@@ -3700,8 +3699,7 @@ def _main_impl():
             word_confidences.clear()
             sentence_buffer.clear()
             sentence_confidences.clear()
-            last_added_letter = None
-            locked_until_reset = False
+            vote_system.reset_lock()
             print("[CLEAR] Word + sentence buffers cleared.")
 
         elif key == 32:  # SPACE — finish current word and push to sentence
@@ -3715,8 +3713,7 @@ def _main_impl():
                 )
             word_buffer.clear()
             word_confidences.clear()
-            last_added_letter = None
-            locked_until_reset = False
+            vote_system.reset_lock()
 
         elif key in (ord("l"), ord("L")):
             # Toggle between English and Tamil
@@ -3743,8 +3740,7 @@ def _main_impl():
                 if word_confidences:
                     word_confidences.pop()
                 print(f"[BKSP] Removed '{removed}'.")
-                last_added_letter = None
-                locked_until_reset = False
+                vote_system.reset_lock()
 
         elif key == 13:  # ENTER — speak the sentence
             print("[DEBUG] ENTER PRESSED")
