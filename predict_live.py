@@ -70,7 +70,7 @@ import sys
 import tempfile
 import threading
 import time
-from collections import Counter, deque
+from collections import Counter, deque, defaultdict
 
 import cv2
 import joblib
@@ -79,13 +79,80 @@ import numpy as np
 import pythoncom
 import pyttsx3
 
-from emotion.emotion_detection import EmotionDetector
+# from emotion.emotion_detection import EmotionDetector  # Imported conditionally
 from database.supabase_client import SupabaseManager
+from system.stability_monitor import StabilityMonitor, SubsystemStatus
 from utils import (  # Enhanced landmarks and engineered features
     extract_enhanced_features,
     extract_raw_normalized_landmarks,
     KerasMLPWrapper,
 )
+
+# ── Performance Profiler ─────────────────────────────────────────────────────
+class Profiler:
+    """Simple per‑frame timer for stage‑wise profiling.
+    Prints a ranked report every `report_interval` frames.
+    When disabled (default), all methods are no‑ops.
+    """
+    def __init__(self, report_interval: int = 30, enabled: bool = False):
+        self.report_interval = report_interval
+        self.enabled = enabled
+        if enabled:
+            self.reset()
+
+    def reset(self):
+        if not self.enabled:
+            return
+        self.stage_times = defaultdict(list)  # stage -> list of ms
+        self.frame_start = 0.0
+        self.frame_idx = 0
+
+    def start_frame(self):
+        if not self.enabled:
+            return
+        self.frame_start = time.time()
+        self.frame_idx += 1
+
+    def start(self, stage: str):
+        if not self.enabled:
+            return
+        self._stage_start = time.time()
+        self._current_stage = stage
+
+    def stop(self, stage: str):
+        if not self.enabled:
+            return
+        elapsed = (time.time() - self._stage_start) * 1000.0
+        self.stage_times[stage].append(elapsed)
+
+    def stop_frame(self):
+        if not self.enabled:
+            return
+        total = (time.time() - self.frame_start) * 1000.0
+        self.stage_times["total"].append(total)
+
+    def report(self):
+        if not self.enabled:
+            return
+        if self.frame_idx % self.report_interval != 0:
+            return
+        total_frames = len(self.stage_times.get("total", []))
+        if total_frames == 0:
+            return
+        avg_total = sum(self.stage_times["total"]) / total_frames
+        fps = 1000.0 / avg_total if avg_total else 0.0
+        # average per stage (exclude total)
+        stage_avgs = {
+            s: sum(t) / len(t) for s, t in self.stage_times.items() if s != "total"
+        }
+        ranking = sorted(stage_avgs.items(), key=lambda i: i[1], reverse=True)
+        print(f"\n[PROFILER] Frame {self.frame_idx}")
+        for i, (stage, ms) in enumerate(ranking, 1):
+            print(f"{i}. {stage:22}: {ms:6.2f} ms")
+        print(f"Total frame time: {avg_total:6.2f} ms   FPS: {fps:5.2f}")
+        # Reset for next interval
+        self.stage_times.clear()
+        self.stage_times["total"] = []
 
 # ── Optional: PIL for Unicode (Tamil) text rendering ────────────────────
 try:
@@ -253,6 +320,20 @@ HAND_MISSING_GRACE_FRAMES = 5
 # ── Emotion Detection Throttle ─────────────────────────────────────────────
 # EMOTION_DETECT_INTERVAL=30: only send frames to emotion detector every 30 frames.
 EMOTION_DETECT_INTERVAL = 30
+
+# ── Performance Test Mode ───────────────────────────────────────────────────────
+# Set to False to completely disable emotion detection (including DeepFace import)
+# without deleting any code. This is useful for measuring the FPS impact of the
+# emotion pipeline.
+ENABLE_EMOTION_DETECTION = True
+
+# ── Profiling: auto-stop after this many frames (0 = run forever) ──────────
+MAX_PROFILE_FRAMES = 0
+
+# ── Profiling Mode ──────────────────────────────────────────────────────────
+# When False, all per-frame timing collection, profiler output, and debug
+# overlays are completely skipped. Set to True only for performance audits.
+ENABLE_PROFILING = False
 
 # ── Webcam Resolution ──────────────────────────────────────────────────────
 WEBCAM_WIDTH = 1920
@@ -2160,6 +2241,7 @@ def draw_hud(
     speech_status,
     selected_language="English",
     translated_text="",
+    emotion_detection_enabled=True,
 ):
     """
     Draw a polished heads-up display overlay.
@@ -2180,6 +2262,7 @@ def draw_hud(
     Args:
         selected_language: Current language mode ("English" or "Tamil").
         translated_text: Tamil translation of the sentence buffer (Tamil mode only).
+        emotion_detection_enabled: If False, skip rendering emotion UI elements.
     """
     h, w = frame.shape[:2]
 
@@ -2324,18 +2407,30 @@ def draw_hud(
     )
 
     # Render Emotion Status
-    emotion_str = state.get("current_emotion", "Neutral")
-    emotion_conf = state.get("emotion_confidence", 0.0)
-    cv2.putText(
-        frame,
-        f"Emotion: {emotion_str} ({emotion_conf * 100:.0f}%)",
-        (debug_x + int(15 * u_scale), y_off + int(72 * u_scale)),
-        cv2.FONT_HERSHEY_SIMPLEX,
-        0.42 * u_scale,
-        WHITE,
-        max(1, int(1 * u_scale)),
-        cv2.LINE_AA,
-    )
+    if emotion_detection_enabled:
+        emotion_str = state.get("current_emotion", "Neutral")
+        emotion_conf = state.get("emotion_confidence", 0.0)
+        cv2.putText(
+            frame,
+            f"Emotion: {emotion_str} ({emotion_conf * 100:.0f}%)",
+            (debug_x + int(15 * u_scale), y_off + int(72 * u_scale)),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.42 * u_scale,
+            WHITE,
+            max(1, int(1 * u_scale)),
+            cv2.LINE_AA,
+        )
+    else:
+        cv2.putText(
+            frame,
+            "Emotion Detection: Disabled (Performance Test Mode)",
+            (debug_x + int(15 * u_scale), y_off + int(72 * u_scale)),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.42 * u_scale,
+            WHITE,
+            max(1, int(1 * u_scale)),
+            cv2.LINE_AA,
+        )
 
     # Render Stability Score
     stability_score = state.get("stability_score", 100)
@@ -3089,6 +3184,11 @@ def _main_impl():
 
     print(f"[OK] Welcome, {current_user['name']}! Starting VisionSpeak...")
 
+    # ── Initialize Stability Monitor ─────────────────────────────────────────
+    monitor = StabilityMonitor()
+    _active_resources['stability_monitor'] = monitor
+    print("[STABILITY] Monitor initialized.")
+
     print("\n" + "=" * 58)
     print("  ASL Sign Language - Live Prediction + Text-to-Speech")
     print("  Bilingual: English / Tamil  [Press L to toggle]")
@@ -3148,7 +3248,21 @@ def _main_impl():
 
     # ── Hand Tracking Stability & Hysteresis State Variables ────────────────
     landmark_smoother = AdaptiveLandmarkSmoother()
-    emotion_detector = EmotionDetector(detect_every_n=EMOTION_DETECT_INTERVAL)
+    if ENABLE_EMOTION_DETECTION:
+        from emotion.emotion_detection import EmotionDetector
+        emotion_detector = EmotionDetector(detect_every_n=EMOTION_DETECT_INTERVAL)
+    else:
+        print("[PERFORMANCE TEST] Emotion Detection Disabled")
+        print("[PERFORMANCE TEST] DeepFace Not Loaded")
+        class DummyEmotionDetector:
+            enabled = False
+            def detect(self, frame):
+                pass
+            def get_emotion(self):
+                return "Neutral", 0.0
+            def shutdown(self):
+                pass
+        emotion_detector = DummyEmotionDetector()
     _active_resources['emotion_detector'] = emotion_detector
     stability_buffer = deque(maxlen=STABILITY_BUFFER_SIZE)
     hand_missing_frames = 0
@@ -3199,6 +3313,7 @@ def _main_impl():
     prev_time = time.time()
     fps = 0.0
 
+    profiler = Profiler(report_interval=30, enabled=ENABLE_PROFILING)
     # Performance tracking (debug panel)
     process_time_history = deque(maxlen=30)  # Rolling 30-frame average
     frame_process_time_ms = 0.0
@@ -3214,7 +3329,14 @@ def _main_impl():
     print(f"        Auto-clear:       {AUTO_CLEAR}\n")
 
     while True:
-        ret, frame = cap.read()
+        profiler.start_frame()
+        profiler.start('camera_capture')
+        with monitor.guard("camera", fallback_value=(False, None)) as cam_guard:
+            if not cam_guard["errored"]:
+                ret, frame = cap.read()
+            else:
+                ret, frame = False, None
+        profiler.stop('camera_capture')
         if not ret:
             print("[WARN] Failed to read frame, retrying...")
             time.sleep(0.1)
@@ -3225,10 +3347,22 @@ def _main_impl():
 
         # Submit frame to emotion detector (Optimization 4)
         if emotion_detector.enabled:
-            emotion_detector.detect(frame)
+            with monitor.guard("emotion", fallback_value=None) as em_guard:
+                if not em_guard["errored"]:
+                    profiler.start('emotion_detect')
+                    emotion_detector.detect(frame)
+                    profiler.stop('emotion_detect')
 
+        profiler.start('bgr2rgb')
         rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-        results = hands.process(rgb)
+        profiler.stop('bgr2rgb')
+        profiler.start('mediapipe')
+        with monitor.guard("mediapipe", fallback_value=None) as mp_guard:
+            if not mp_guard["errored"]:
+                results = hands.process(rgb)
+            else:
+                results = type('', (), {'multi_hand_landmarks': None})()
+        profiler.stop('mediapipe')
 
         hand_detected = False
         now = time.time()
@@ -3356,27 +3490,33 @@ def _main_impl():
 
                 # Only predict on active hand track (not grace period recovery frames)
                 if tracking_status == "ACTIVE":
-                    # Extract features based on model expectation (Compatibility Mode)
-                    if MODEL_EXPECTS_ENHANCED:
-                        features = extract_enhanced_features(hand_lm).reshape(1, -1)
-                    else:
-                        features = extract_landmarks(hand_lm).reshape(1, -1)
+                    with monitor.guard("prediction", extra_context={"hand_status": hand_status}) as pred_guard:
+                        if not pred_guard["errored"]:
+                            # Extract features based on model expectation (Compatibility Mode)
+                            profiler.start('feature_extraction')
+                            if MODEL_EXPECTS_ENHANCED:
+                                features = extract_enhanced_features(hand_lm).reshape(1, -1)
+                            else:
+                                features = extract_landmarks(hand_lm).reshape(1, -1)
 
-                    features_scaled = scaler.transform(features)
-                    probs = model.predict_proba(features_scaled)[0]
-                    raw_pred = np.argmax(probs)
-                    current_prediction = le.inverse_transform([raw_pred])[0]
+                            features_scaled = scaler.transform(features)
+                            profiler.stop('feature_extraction')
+                            profiler.start('prediction')
+                            probs = model.predict_proba(features_scaled)[0]
+                            raw_pred = np.argmax(probs)
+                            current_prediction = le.inverse_transform([raw_pred])[0]
 
-                    # ── PHASE 6: Calibrated confidence ─────────────────────────
-                    logits = np.log(probs + 1e-12)
-                    calibrated = calibrate_confidence(logits)[0]
-                    top2_indices = np.argsort(calibrated)[-2:][::-1]
-                    confidence = float(calibrated[top2_indices[0]])
-                    second_best_confidence = float(calibrated[top2_indices[1]])
-                    second_best_prediction = le.inverse_transform(
-                        [top2_indices[1]]
-                    )[0]
-                    gap = confidence - second_best_confidence
+                            # ── PHASE 6: Calibrated confidence ─────────────────────────
+                            logits = np.log(probs + 1e-12)
+                            calibrated = calibrate_confidence(logits)[0]
+                            top2_indices = np.argsort(calibrated)[-2:][::-1]
+                            confidence = float(calibrated[top2_indices[0]])
+                            second_best_confidence = float(calibrated[top2_indices[1]])
+                            second_best_prediction = le.inverse_transform(
+                                [top2_indices[1]]
+                            )[0]
+                            gap = confidence - second_best_confidence
+                            profiler.stop('prediction')
 
                     # ── Rule engine correction for borderline predictions ─────
                     auto_corrected = False
@@ -3423,6 +3563,7 @@ def _main_impl():
                 # else: recovery frames — skip prediction
 
             # ── TASK 2: Get stable prediction from majority voting ──
+            profiler.start('temporal_logic')
             stable_prediction, agreement_pct, vote_status = vote_system.get_stable_prediction()
 
             # ── Commit letter when:
@@ -3440,6 +3581,7 @@ def _main_impl():
                 print(
                     f"[COMMIT] '{stable_prediction}' added. Word: {''.join(word_buffer)}"
                 )
+            profiler.stop('temporal_logic')
         else:
             # No hand detected at all (and grace expired)
             hand_status = "No Hand Detected"
@@ -3613,7 +3755,13 @@ def _main_impl():
         emotion_str = "Neutral"
         emotion_conf = 0.0
         if emotion_detector.enabled:
-            emotion_str, emotion_conf = emotion_detector.get_emotion()
+            with monitor.guard("emotion", fallback_value=None) as em_get_guard:
+                if not em_get_guard["errored"]:
+                    profiler.start('emotion_get')
+                    emotion_str, emotion_conf = emotion_detector.get_emotion()
+                    profiler.stop('emotion_get')
+                else:
+                    emotion_str, emotion_conf = "Neutral", 0.0
 
         # ── Calculate Hand Stability Score ──────────────────────────────
         stability_score = calculate_stability_score(stability_buffer)
@@ -3663,13 +3811,23 @@ def _main_impl():
         fps = 0.8 * fps + 0.2 * (1.0 / max(now - prev_time, 1e-6))
         prev_time = now
 
+        # Update stability monitor with latest performance data
+        monitor.update_performance_snapshot(fps, frame_process_time_ms, cap.isOpened())
+
         # ── Determine translated text for display (Tamil mode) ──────────
         display_translated = ""
         if selected_language == "Tamil" and sentence_buffer:
             sentence_text = " ".join(sentence_buffer)
-            display_translated = translator.translate(sentence_text)
+            profiler.start('translation')
+            with monitor.guard("translation", fallback_value="") as tr_guard:
+                if not tr_guard["errored"]:
+                    display_translated = translator.translate(sentence_text)
+                else:
+                    display_translated = ""
+            profiler.stop('translation')
 
         # ── Draw HUD ────────────────────────────────────────────────────
+        profiler.start('hud_draw')
         draw_hud(
             frame,
             current_prediction,
@@ -3684,9 +3842,15 @@ def _main_impl():
             tts.status,
             selected_language=selected_language,
             translated_text=display_translated,
+            emotion_detection_enabled=ENABLE_EMOTION_DETECTION,
         )
+        profiler.stop('hud_draw')
 
-        cv2.imshow("ASL Sign Language Recognition", frame)
+        profiler.start('display')
+        with monitor.guard("display") as disp_guard:
+            if not disp_guard["errored"]:
+                cv2.imshow("ASL Sign Language Recognition", frame)
+        profiler.stop('display')
 
         # ── Key handling ────────────────────────────────────────────────
         key = cv2.waitKey(1) & 0xFF
@@ -3764,7 +3928,11 @@ def _main_impl():
                 avg_conf = round(avg_conf, 1)
 
                 # Apply translation based on current language
-                translated = translator.translate(full_sentence)
+                with monitor.guard("translation", fallback_value=full_sentence) as tr_guard2:
+                    if not tr_guard2["errored"]:
+                        translated = translator.translate(full_sentence)
+                    else:
+                        translated = full_sentence
                 tts_language = selected_language
 
                 if selected_language == "Tamil":
@@ -3786,27 +3954,41 @@ def _main_impl():
                     speak_text = full_sentence
                     english_fallback = ""
 
-                spoken = tts.speak(
-                    speak_text, language=tts_language, english_fallback=english_fallback
-                )
+                profiler.start('tts_queue')
+                with monitor.guard("tts", fallback_value=None) as tts_guard:
+                    if not tts_guard["errored"]:
+                        spoken = tts.speak(
+                            speak_text, language=tts_language, english_fallback=english_fallback
+                        )
+                    else:
+                        spoken = None
+                profiler.stop('tts_queue')
                 print(f"[DEBUG] speak() returned:\n{spoken}")
                 if spoken:
                     feedback_message = f"Speaking: {full_sentence}"
                     feedback_timestamp = now
 
                     # Save to Supabase with language and translation info
-                    save_recognition(
-                        recognized_text=full_sentence,
-                        translated_text=translated
-                        if selected_language == "Tamil"
-                        else "",
-                        selected_language=selected_language,
-                        confidence=avg_conf,
-                    )
+                    profiler.start('supabase_write')
+                    with monitor.guard("supabase") as db_guard:
+                        if not db_guard["errored"]:
+                            save_recognition(
+                                recognized_text=full_sentence,
+                                translated_text=translated
+                                if selected_language == "Tamil"
+                                else "",
+                                selected_language=selected_language,
+                                confidence=avg_conf,
+                            )
+                    profiler.stop('supabase_write')
             else:
                 print("[TTS] No text available to speak.")
                 feedback_message = "No text to speak"
                 feedback_timestamp = now
+        profiler.stop_frame()
+        profiler.report()
+        if MAX_PROFILE_FRAMES > 0 and profiler.frame_idx >= MAX_PROFILE_FRAMES:
+            break
 
     # ── Cleanup ─────────────────────────────────────────────────────────────
     emotion_detector.shutdown()
@@ -3819,6 +4001,8 @@ def _main_impl():
     print(f"\n[OK] Session ended.")
     print(f"     Final word:     {final_word}")
     print(f"     Final sentence: {final_sentence}")
+
+    # ── Stability Report ─────────────────────────────────────────────────────
 
 
 def main():

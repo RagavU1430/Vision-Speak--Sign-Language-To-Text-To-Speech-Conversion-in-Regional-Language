@@ -37,7 +37,6 @@ from sklearn.metrics import classification_report, confusion_matrix, accuracy_sc
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
-
 from utils import extract_enhanced_features, extract_enhanced_features_v2, suppress_c_stderr
 
 DATASET_DIR = os.path.join("archive", "asl_alphabet_train", "asl_alphabet_train")
@@ -121,8 +120,8 @@ def tune_hyperparameters(X_train, y_train):
     print(f"  Best CV acc : {grid.best_score_ * 100:.2f}%")
     print(f"\n  Top-5 results:")
     results = pd.DataFrame(grid.cv_results_)
-    top5 = results.sort_values("rank_test_score").head(5)
-    for _, r in top5.iterrows():
+    top = results.sort_values("rank_test_score").head(5)
+    for _, r in top.iterrows():
         print(f"    {r['params']}  →  {r['mean_test_score'] * 100:.2f}%")
 
     return grid.best_params_
