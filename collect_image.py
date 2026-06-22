@@ -15,7 +15,7 @@ labels = [
     'Help'
 ]
 
-number_of_images = 200  # increase this
+number_of_images = 30
 
 cap = cv2.VideoCapture(0)
 
@@ -25,10 +25,8 @@ for label in labels:
     os.makedirs(label_path, exist_ok=True)
 
     print(f"\nCollecting images for {label}")
-    print("Press SPACE to capture image")
-    print("Press Q to skip current class")
-
-    time.sleep(2)
+    print("Press SPACE to capture")
+    print("Press Q to skip")
 
     img_count = 0
 
@@ -39,11 +37,11 @@ for label in labels:
         if not ret:
             continue
 
-        display_frame = frame.copy()
+        display = frame.copy()
 
         cv2.putText(
-            display_frame,
-            f"{label} : {img_count}/{number_of_images}",
+            display,
+            f"{label}: {img_count}/{number_of_images}",
             (20, 40),
             cv2.FONT_HERSHEY_SIMPLEX,
             1,
@@ -51,25 +49,23 @@ for label in labels:
             2
         )
 
-        cv2.imshow("VisionSpeak Dataset Collection", display_frame)
+        cv2.imshow("VisionSpeak Phrase Collection", display)
 
         key = cv2.waitKey(1)
 
-        # SPACE = Capture
-        if key == 32:
+        if key == 32:  # SPACE
 
-            image_name = os.path.join(
+            filename = os.path.join(
                 label_path,
-                f"{label}.{uuid.uuid4()}.jpg"
+                f"{label}_{uuid.uuid4()}.jpg"
             )
 
-            cv2.imwrite(image_name, frame)
+            cv2.imwrite(filename, frame)
 
             img_count += 1
 
-            print(f"Saved: {img_count}")
+            print(f"Saved {img_count}/{number_of_images}")
 
-        # Q = Skip
         elif key & 0xFF == ord('q'):
             break
 
